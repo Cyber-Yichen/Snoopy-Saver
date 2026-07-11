@@ -1,0 +1,27 @@
+# Extracted Apple assets are local-only and must never enter Git.
+LocalAssets/
+docs/
+Tools/
+Scripts/extract_assets.py
+__pycache__/
+*.pyc
+
+# Never commit extracted or packaged media outside LocalAssets either.
+*.saver/
+*.mov
+*.heic
+*.icmetadata
+*.icversion
+*.icassetmanifest
+*.tar.encrypted
+
+# Xcode and local build products.
+.build/
+build/
+DerivedData/
+.reverse/
+*.xcuserstate
+xcuserdata/
+
+# macOS metadata.
+.DS_Store
