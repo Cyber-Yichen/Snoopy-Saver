@@ -33,7 +33,30 @@ Snoopy Saver 的核心目标，是把 tvOS 中的史努比屏幕保护程序尽�
 
 屏保启动时有相同概率进入全屏动画或多图层场景。IdleScene 通常持续 20–60 秒，期间史努比会更换动作，Woodstock 和其他访客也可能出现，随后插播一段全屏动画。无声音、无时钟和文字叠加。
 
-> 本仓库只包含屏保实现源码、构建/安装脚本和设置缩略图，不包含素材获取代码、测试工具、实现分析记录、Apple 或 Peanuts 的视频、图片及其他媒体文件，也不提交构建好的 `.saver`。
+### 不同时间与季节
+
+下面的画面由最终版场景目录按照对应日期、时间和天气条件实际评分后选出。相同条件下仍可能出现其他同分场景，近期播放记录也会影响最终选择。
+
+<table>
+  <tr>
+    <td width="50%"><img src="Assets/spring-morning.jpg" alt="春日清晨"><br><sub>春日清晨 · 晴朗</sub></td>
+    <td width="50%"><img src="Assets/summer-afternoon.jpg" alt="夏日下午"><br><sub>夏日下午 · 晴朗</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="Assets/autumn-evening.jpg" alt="秋日傍晚"><br><sub>秋日傍晚 · 有风</sub></td>
+    <td width="50%"><img src="Assets/winter-late-night.jpg" alt="冬季深夜"><br><sub>冬季深夜 · 下雪</sub></td>
+  </tr>
+</table>
+
+### 8 月 10 日：史努比生日彩蛋
+
+每年 8 月 10 日，日期相关性会优先触发史努比生日内容。冒烟测试确认清晨、下午、傍晚和深夜四个时段均能选中生日专属的全屏故事、多图层场景、访客与角色动作。
+
+![8 月 10 日史努比生日彩蛋](Assets/birthday-aug10.jpg)
+
+<sub>测试日期：2026-08-10，Asia/Shanghai；截图来自全屏生日场景。</sub>
+
+> 本仓库只包含屏保实现源码、构建/安装脚本和设置缩略图，不包含素材获取代码、测试工具、实现分析记录、用于运行的 Apple 或 Peanuts 媒体，也不提交构建好的 `.saver`。README 中的少量低分辨率截图仅用于功能展示与测试记录。
 
 ## 工作方式
 
