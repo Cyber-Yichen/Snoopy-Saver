@@ -9,6 +9,14 @@
 
 [简体中文](README.md) · **English**
 
+> [!IMPORTANT]
+> **Latest release: Snoopy 1.1 (V1.1.0) · July 21, 2026**
+>
+> Version 1.1 focuses on long-running efficiency: it fixes elevated energy use, fan activity, and IdleScene frame drops; restructures the lifecycle of players, layers, HEIC decoding caches, and background work; and adds a new System Settings thumbnail.
+>
+> - [GitHub Release: split download and full release notes](https://github.com/Cyber-Yichen/Snoopy-Saver/releases/tag/V1.1.0)—download the installer ZIP and all four DMG parts, place them in one folder, then run the installer.
+> - [Baidu Netdisk: complete archive](https://pan.baidu.com/s/17pI0PTYSRbr7G-a06zrEBg?pwd=f2vm)—file `SnoopyScreenSaver 1.1zip.zip`, extraction code `f2vm`.
+
 Snoopy Saver aims to bring the Snoopy screen saver from tvOS to macOS as completely as possible. It preserves the full-screen animated stories while rebuilding the layered scenes made from backgrounds, characters, visitors, weather effects, and palettes. The next scene is selected using date, time, weather, and recent play history.
 
 The project has achieved:
