@@ -3,23 +3,151 @@ import AVFoundation
 import ImageIO
 import QuartzCore
 
-private final class FrameCache {
-    static let shared = FrameCache()
-    private let cache = NSCache<NSString, NSImage>()
+/// Decodes HEIC frames away from the Core Animation commit path. `NSImage`
+/// keeps its ImageIO source lazy, so merely creating one on the main thread
+/// still leaves the expensive HEIF decompression for `CALayer` to perform.
+/// The immediate thumbnail below guarantees that layers only ever receive
+/// decoded pixels. A bounded shared cache and two workers limit memory and CPU.
+private final class FrameDecoder {
+    private final class Entry {
+        let image: CGImage
+        let cost: Int
+        init(_ image: CGImage) {
+            self.image = image
+            cost = image.bytesPerRow * image.height
+        }
+    }
+
+    static let shared = FrameDecoder()
+
+    typealias Callback = (CGImage?) -> Void
+    private final class Request {
+        var clients: Set<UUID> = []
+        var callbacks: [UUID: [Callback]] = [:]
+        var operation: BlockOperation?
+    }
+
+    private let cache = NSCache<NSString, Entry>()
+    private let queue: OperationQueue
+    private let lock = NSLock()
+    private var inFlight: [String: Request] = [:]
+
     private init() {
-        cache.countLimit = 32
-        cache.totalCostLimit = 192 * 1024 * 1024
+        cache.countLimit = 64
+        cache.totalCostLimit = 256 * 1024 * 1024
+        queue = OperationQueue()
+        queue.name = "local.snoopy.frame-decoder"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
     }
-    func image(_ url: URL) -> NSImage? {
-        let key = url.path as NSString
-        if let image = cache.object(forKey: key) { return image }
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        let image = NSImage(cgImage: cg, size: .zero)
-        cache.setObject(image, forKey: key, cost: cg.width * cg.height * 4)
-        return image
+
+    func key(for url: URL, maxPixelSize: Int) -> String {
+        "\(url.path)#\(maxPixelSize)"
     }
-    func removeAll() { cache.removeAllObjects() }
+
+    func cachedImage(for url: URL, maxPixelSize: Int) -> CGImage? {
+        cache.object(forKey: key(for: url, maxPixelSize: maxPixelSize) as NSString)?.image
+    }
+
+    func request(
+        _ url: URL,
+        maxPixelSize: Int,
+        clientID: UUID,
+        completion: Callback? = nil
+    ) {
+        let cacheKey = key(for: url, maxPixelSize: maxPixelSize)
+        if let image = cache.object(forKey: cacheKey as NSString)?.image {
+            completion?(image)
+            return
+        }
+
+        lock.lock()
+        if let request = inFlight[cacheKey] {
+            request.clients.insert(clientID)
+            if let completion { request.callbacks[clientID, default: []].append(completion) }
+            lock.unlock()
+            return
+        }
+        let request = Request()
+        request.clients.insert(clientID)
+        if let completion { request.callbacks[clientID] = [completion] }
+        let operation = BlockOperation()
+        request.operation = operation
+        inFlight[cacheKey] = request
+        lock.unlock()
+
+        operation.addExecutionBlock { [weak self, weak operation] in
+            guard let self, operation?.isCancelled == false else { return }
+            let image = autoreleasepool {
+                Self.decode(url, maxPixelSize: maxPixelSize)
+            }
+            guard operation?.isCancelled == false else {
+                self.finish(cacheKey, image: nil)
+                return
+            }
+            self.finish(cacheKey, image: image)
+        }
+        queue.addOperation(operation)
+    }
+
+    func cancelRequests(for clientID: UUID) {
+        lock.lock()
+        for key in Array(inFlight.keys) {
+            guard let request = inFlight[key] else { continue }
+            request.clients.remove(clientID)
+            request.callbacks.removeValue(forKey: clientID)
+            if request.clients.isEmpty {
+                request.operation?.cancel()
+                inFlight.removeValue(forKey: key)
+            }
+        }
+        lock.unlock()
+    }
+
+    func removeAll() {
+        lock.lock()
+        let operations = inFlight.values.compactMap(\.operation)
+        inFlight.removeAll()
+        lock.unlock()
+        operations.forEach { $0.cancel() }
+        cache.removeAllObjects()
+    }
+
+    private func finish(_ cacheKey: String, image: CGImage?) {
+        lock.lock()
+        let request = inFlight.removeValue(forKey: cacheKey)
+        lock.unlock()
+        guard let request else { return }
+        if let image {
+            let entry = Entry(image)
+            cache.setObject(entry, forKey: cacheKey as NSString, cost: entry.cost)
+        }
+        let callbacks = request.callbacks.values.flatMap { $0 }
+        guard !callbacks.isEmpty else { return }
+        OperationQueue.main.addOperation {
+            callbacks.forEach { $0(image) }
+        }
+    }
+
+    private static func decode(_ url: URL, maxPixelSize: Int) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(
+            url as CFURL,
+            [kCGImageSourceShouldCache: false] as CFDictionary
+        ) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(64, maxPixelSize),
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let sourceImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+
+        // `ShouldCacheImmediately` makes this a decoded thumbnail rather than
+        // the lazy ImageIO-backed image used by the old implementation.
+        return sourceImage
+    }
 }
 
 final class SpriteAssetPlayer {
@@ -35,6 +163,12 @@ final class SpriteAssetPlayer {
     private var frameLayer: CALayer?
     private var frameDescriptor: SpriteDescriptor?
     private var frameStarted = Date()
+    private var frameGeneration = 0
+    private var frameReady = false
+    private var desiredFrameKey: String?
+    private var pendingFrameKey: String?
+    private var decoderClientID = UUID()
+    private var frameURLs: [String: URL] = [:]
     private(set) var isPlaying = false
     var debugLayerCount: Int { layers.count }
     var onReady: (() -> Void)?
@@ -45,7 +179,7 @@ final class SpriteAssetPlayer {
 
     deinit { stop() }
 
-    static func purgeCaches() { FrameCache.shared.removeAll() }
+    static func purgeCaches() { FrameDecoder.shared.removeAll() }
 
     func play(
         _ asset: AssetRecord,
@@ -70,12 +204,11 @@ final class SpriteAssetPlayer {
     }
 
     func tick(_ date: Date = Date()) {
-        guard let descriptor = frameDescriptor, let layer = frameLayer else { return }
+        guard frameReady, let descriptor = frameDescriptor, let layer = frameLayer else { return }
         let elapsed = Int(max(0, date.timeIntervalSince(frameStarted)) * 30)
         let local = descriptor.loops ? elapsed % descriptor.frameCount : min(descriptor.frameCount - 1, elapsed)
-        if let url = descriptor.frameURL(descriptor.startFrame + local), let image = FrameCache.shared.image(url) {
-            layer.contents = image
-        }
+        requestFrame(descriptor.startFrame + local, descriptor: descriptor, layer: layer, generation: frameGeneration)
+        prefetch(descriptor, after: local, count: 6)
     }
 
     func resize() {
@@ -87,15 +220,23 @@ final class SpriteAssetPlayer {
 
     func stop() {
         isPlaying = false
+        FrameDecoder.shared.cancelRequests(for: decoderClientID)
+        decoderClientID = UUID()
+        frameGeneration += 1
+        frameReady = false
+        desiredFrameKey = nil
+        pendingFrameKey = nil
+        frameURLs.removeAll(keepingCapacity: false)
         onReady = nil
         workItems.forEach { $0.cancel() }; workItems.removeAll()
         observers.forEach(NotificationCenter.default.removeObserver); observers.removeAll()
         observations.forEach { $0.invalidate() }; observations.removeAll()
+        layers.compactMap { $0 as? AVPlayerLayer }.forEach { $0.player = nil }
         players.forEach {
             $0.cancelPendingPrerolls(); $0.pause(); $0.replaceCurrentItem(with: nil)
         }
         players.removeAll()
-        layers.forEach { $0.removeFromSuperlayer() }; layers.removeAll()
+        layers.forEach { $0.removeAllAnimations(); $0.removeFromSuperlayer() }; layers.removeAll()
         layerDescriptors.removeAll()
         frameLayer = nil; frameDescriptor = nil
     }
@@ -168,22 +309,30 @@ final class SpriteAssetPlayer {
             return
         }
         let layer = CALayer(); layer.contentsGravity = .resizeAspect
+        layer.opacity = 0
         configure(layer, sprite: intro); frameLayer = layer
-        activateFrame(intro, on: layer); reveal(layer)
         let introDuration = Double(intro.frameCount) / 30
         let outroDuration = Double(outro.frameCount) / 30
         let loopDuration = max(Double(loop.frameCount) / 30, targetDuration - introDuration - outroDuration)
-        schedule(introDuration) { [weak self, weak layer] in
+        activateFrame(intro, on: layer) { [weak self, weak layer] in
             guard let self, let layer, self.isPlaying else { return }
-            // Keep the same CALayer and replace contents only after the first
-            // incoming frame has decoded. There is no remove/add blank frame.
-            self.activateFrame(loop, on: layer)
-            self.schedule(loopDuration) { [weak self, weak layer] in
+            self.schedule(introDuration) { [weak self, weak layer] in
                 guard let self, let layer, self.isPlaying else { return }
-                self.activateFrame(outro, on: layer)
-                self.schedule(outroDuration) { [weak self] in
-                    guard let self, self.isPlaying else { return }
-                    self.isPlaying = false; completion?()
+                // Keep the same CALayer and retain the previous phase's last
+                // frame until the first decoded frame of the next phase is
+                // available. This avoids the one-frame transparent gap.
+                self.activateFrame(loop, on: layer) { [weak self, weak layer] in
+                    guard let self, let layer, self.isPlaying else { return }
+                    self.schedule(loopDuration) { [weak self, weak layer] in
+                        guard let self, let layer, self.isPlaying else { return }
+                        self.activateFrame(outro, on: layer) { [weak self] in
+                            guard let self, self.isPlaying else { return }
+                            self.schedule(outroDuration) { [weak self] in
+                                guard let self, self.isPlaying else { return }
+                                self.isPlaying = false; completion?()
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -192,6 +341,7 @@ final class SpriteAssetPlayer {
     private func playOneShot(_ sprite: SpriteDescriptor, repeatWhole: Bool, completion: (() -> Void)?) {
         if sprite.mediaType == .frameSequence {
             let layer = CALayer(); layer.contentsGravity = .resizeAspect
+            layer.opacity = 0
             configure(layer, sprite: sprite); frameLayer = layer
             var descriptor = sprite
             if repeatWhole && !sprite.loops {
@@ -200,9 +350,14 @@ final class SpriteAssetPlayer {
                     alignment: sprite.alignment, plane: sprite.plane, loops: true,
                     startFrame: sprite.startFrame, endFrame: sprite.endFrame, digitCount: sprite.digitCount)
             }
-            activateFrame(descriptor, on: layer); reveal(layer)
-            if !repeatWhole && !sprite.loops {
-                schedule(Double(sprite.frameCount) / 30) { [weak self] in self?.isPlaying = false; completion?() }
+            activateFrame(descriptor, on: layer) { [weak self] in
+                guard let self, self.isPlaying else { return }
+                if !repeatWhole && !sprite.loops {
+                    self.schedule(Double(sprite.frameCount) / 30) { [weak self] in
+                        guard let self, self.isPlaying else { return }
+                        self.isPlaying = false; completion?()
+                    }
+                }
             }
         } else if let url = sprite.movieURL {
             let item = AVPlayerItem(url: url), player = AVPlayer(playerItem: item)
@@ -241,13 +396,123 @@ final class SpriteAssetPlayer {
         CATransaction.commit()
         onReady?(); onReady = nil
     }
-    private func activateFrame(_ descriptor: SpriteDescriptor, on layer: CALayer) {
-        if let url = descriptor.frameURL(descriptor.startFrame), let image = FrameCache.shared.image(url) {
-            layer.contents = image
-        }
-        frameDescriptor = descriptor; frameStarted = Date()
+    private func activateFrame(
+        _ descriptor: SpriteDescriptor,
+        on layer: CALayer,
+        completion: (() -> Void)? = nil
+    ) {
+        frameGeneration += 1
+        let generation = frameGeneration
+        frameDescriptor = descriptor
+        frameReady = false
+        desiredFrameKey = nil
+        pendingFrameKey = nil
         layerDescriptors[ObjectIdentifier(layer)] = descriptor
         layer.frame = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
+        requestFrame(
+            descriptor.startFrame,
+            descriptor: descriptor,
+            layer: layer,
+            generation: generation
+        ) { [weak self, weak layer] in
+            guard let self, let layer, self.isPlaying, self.frameGeneration == generation else { return }
+            self.frameReady = true
+            self.frameStarted = Date()
+            self.reveal(layer)
+            completion?()
+        }
+        prefetch(descriptor, after: 0, count: 6)
+    }
+
+    private func requestFrame(
+        _ frameNumber: Int,
+        descriptor: SpriteDescriptor,
+        layer: CALayer,
+        generation: Int,
+        firstFrameCompletion: (() -> Void)? = nil
+    ) {
+        guard let url = frameURL(frameNumber, descriptor: descriptor) else { return }
+        let pixelSize = targetPixelSize(for: descriptor)
+        let key = FrameDecoder.shared.key(for: url, maxPixelSize: pixelSize)
+        desiredFrameKey = key
+
+        if let image = FrameDecoder.shared.cachedImage(for: url, maxPixelSize: pixelSize) {
+            installFrame(
+                image,
+                key: key,
+                layer: layer,
+                generation: generation,
+                completion: firstFrameCompletion
+            )
+            return
+        }
+        guard pendingFrameKey != key else { return }
+        pendingFrameKey = key
+        FrameDecoder.shared.request(
+            url,
+            maxPixelSize: pixelSize,
+            clientID: decoderClientID
+        ) { [weak self, weak layer] image in
+            guard let self, let layer else { return }
+            if self.pendingFrameKey == key { self.pendingFrameKey = nil }
+            guard let image, self.desiredFrameKey == key else { return }
+            self.installFrame(
+                image,
+                key: key,
+                layer: layer,
+                generation: generation,
+                completion: firstFrameCompletion
+            )
+        }
+    }
+
+    private func installFrame(
+        _ image: CGImage,
+        key: String,
+        layer: CALayer,
+        generation: Int,
+        completion: (() -> Void)?
+    ) {
+        guard isPlaying, frameGeneration == generation, desiredFrameKey == key, frameLayer === layer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.contents = image
+        CATransaction.commit()
+        completion?()
+    }
+
+    private func prefetch(_ descriptor: SpriteDescriptor, after localFrame: Int, count: Int) {
+        let pixelSize = targetPixelSize(for: descriptor)
+        for offset in 1...count {
+            let local: Int
+            if descriptor.loops {
+                local = (localFrame + offset) % descriptor.frameCount
+            } else {
+                local = min(descriptor.frameCount - 1, localFrame + offset)
+            }
+            guard let url = frameURL(descriptor.startFrame + local, descriptor: descriptor) else { continue }
+            FrameDecoder.shared.request(url, maxPixelSize: pixelSize, clientID: decoderClientID)
+            if !descriptor.loops && local == descriptor.frameCount - 1 { break }
+        }
+    }
+
+    private func targetPixelSize(for descriptor: SpriteDescriptor) -> Int {
+        let frame = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
+        // Decode at the logical display size. The line-art assets remain crisp,
+        // while a 40-frame base-pose loop can stay resident in the bounded
+        // cache instead of being decompressed again on every repetition.
+        let longestSide = min(1920, max(frame.width, frame.height))
+        // Quantization prevents a resize from generating many nearly identical
+        // cache variants while still decoding at the current display size.
+        return max(256, Int(ceil(longestSide / 128)) * 128)
+    }
+
+    private func frameURL(_ number: Int, descriptor: SpriteDescriptor) -> URL? {
+        let key = "\(descriptor.baseName)#\(number)"
+        if let url = frameURLs[key] { return url }
+        guard let url = descriptor.frameURL(number) else { return nil }
+        frameURLs[key] = url
+        return url
     }
     private func configure(_ layer: CALayer, sprite: SpriteDescriptor) {
         layer.frame = ViewportLayout.spriteFrame(sprite, in: hostBounds(), sceneOffset: sceneOffset)
