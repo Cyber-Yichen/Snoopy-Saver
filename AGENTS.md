@@ -27,10 +27,13 @@ If preflight fails, stop mutations and resolve the reported branch, media, versi
 
 ## 3. Branch and version discipline
 
-- `main` is the stable published 1.1 line. Treat it as protected. Do not commit product changes directly to `main`.
-- Product parity and new behavior are integrated on `test/*` branches. If a change task starts on `main`, create a purpose-specific `test/<name>` branch unless the user explicitly names another branch.
+- `main` is the stable published line. Treat it as protected and do not commit product changes directly to it.
+- `beta` is the stabilization line. It receives changes from `alpha` only after the current test cycle is considered stable; while stabilizing, limit direct changes to release-blocking fixes and validation.
+- `alpha` is the active development and integration line. New features, parity work, refactors, and Agent Harness changes go here by default.
+- Promotion direction is `alpha` -> `beta` -> `main`. Promotion, merge, or release still requires explicit current-user authorization; never advance a downstream branch automatically.
+- If a change task starts on `main`, switch to `alpha` before editing unless the user explicitly authorizes another branch strategy. Do not create ad-hoc `test/*`, `codex/*`, or `agent/*` branches for routine work.
 - Never force-push, rewrite a published branch, move a tag, delete a branch/tag, or reset another person's work without explicit approval.
-- Do not merge a test branch into `main`, publish a release, or create/update a release tag unless the current user explicitly requests that release action.
+- Do not merge `alpha` into `beta`, merge `beta` into `main`, publish a release, or create/update a release tag unless the current user explicitly requests that exact promotion or release action.
 - Do not change `CFBundleShortVersionString` or `CFBundleVersion` as incidental cleanup. A version/build change requires explicit user intent and must be reflected in `.agents/project-state.json` in the same commit.
 - Before pushing, state the target branch. Media and `.saver` files must remain ignored. Push only the intended branch.
 

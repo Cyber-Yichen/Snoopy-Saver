@@ -33,6 +33,18 @@ except (OSError, json.JSONDecodeError, plistlib.InvalidFileException) as error:
 if state.get("schemaVersion") != 1:
     fail("unsupported or missing schemaVersion")
 
+repository = state.get("repository", {})
+branch_model = {
+    "stableBranch": "main",
+    "betaBranch": "beta",
+    "alphaBranch": "alpha",
+}
+for field_name, expected in branch_model.items():
+    if repository.get(field_name) != expected:
+        fail(f"repository.{field_name} must be {expected!r}")
+if repository.get("promotionOrder") != ["alpha", "beta", "main"]:
+    fail("repository.promotionOrder must be alpha -> beta -> main")
+
 product = state.get("product", {})
 metadata_pairs = {
     "shortVersion": "CFBundleShortVersionString",

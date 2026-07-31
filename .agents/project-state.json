@@ -1,13 +1,19 @@
 {
   "schemaVersion": 1,
-  "capturedAt": "2026-07-31T19:35:00+08:00",
+  "capturedAt": "2026-07-31T20:05:42+08:00",
   "repository": {
     "name": "Snoopy-Saver",
     "stableBranch": "main",
     "stableHeadAtCapture": "ff6b03d1b05b6be17bed6f1481a361413904682d",
-    "productIntegrationBranch": "test/official-theme-parity-alpha-r2",
-    "productIntegrationHeadAtCapture": "68cb156702eb38a735db88b216ebd794378098ef",
-    "agentHarnessBranch": "test/harness-engineering",
+    "betaBranch": "beta",
+    "betaHeadAtCapture": "68cb156702eb38a735db88b216ebd794378098ef",
+    "alphaBranch": "alpha",
+    "alphaHeadAtCapture": "b8190612be776f354709cc5908939d0f17443553",
+    "promotionOrder": [
+      "alpha",
+      "beta",
+      "main"
+    ],
     "latestPublishedTag": "V1.1.0"
   },
   "product": {

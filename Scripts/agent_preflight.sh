@@ -41,17 +41,26 @@ if [[ "$MODE" == "change" ]]; then
       echo "Refusing product mutation on protected or detached branch: ${BRANCH:-detached}" >&2
       exit 3
       ;;
-    test/*|agent/*|codex/*|perf/*|perf-*) ;;
+    alpha|beta) ;;
     *)
-      echo "Unclassified change branch: $BRANCH" >&2
+      echo "Refusing mutation outside the alpha/beta branch model: $BRANCH" >&2
       exit 3
       ;;
   esac
 fi
 
-if [[ "$MODE" == "release" && "${SNOOPY_RELEASE_APPROVED:-}" != "1" ]]; then
-  echo "Release mode requires explicit SNOOPY_RELEASE_APPROVED=1." >&2
-  exit 4
+if [[ "$MODE" == "release" ]]; then
+  if [[ "${SNOOPY_RELEASE_APPROVED:-}" != "1" ]]; then
+    echo "Release mode requires explicit SNOOPY_RELEASE_APPROVED=1." >&2
+    exit 4
+  fi
+  case "$BRANCH" in
+    beta|main) ;;
+    *)
+      echo "Release mode is permitted only on beta or main, not $BRANCH." >&2
+      exit 4
+      ;;
+  esac
 fi
 
 FORBIDDEN="$(git ls-files | awk '
