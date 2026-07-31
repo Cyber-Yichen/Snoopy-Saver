@@ -1,5 +1,5 @@
 # Extracted Apple assets are local-only and must never enter Git.
-LocalAssets/
+LocalAssets
 docs/
 Tools/
 Scripts/extract_assets.py
@@ -17,6 +17,7 @@ __pycache__/
 
 # Xcode and local build products.
 .build/
+.tmp/
 build/
 DerivedData/
 .reverse/

@@ -16,11 +16,94 @@ enum TimeBand: String, CaseIterable {
 enum AssetKind: String, CaseIterable {
     case activeScene, idleScene, idleSceneVisitor, characterBasePose
     case characterAdditionalPose, characterMoment, characterPoseTransition
+    case characterSceneTransitionPose, spriteTransitionParameters
     case sceneTransitionCategory, sceneTransitionPair, scenePalette, switcherScene
 }
 
 enum SpritePhase: String, CaseIterable { case oneShot, intro, loop, outro }
 enum SpriteMediaType: String { case video, frameSequence }
+enum SceneTransitionPhase: String { case hide, reveal }
+
+enum MediaLibrary {
+    /// CDN-downloaded media is kept outside the saver bundle so a lightweight
+    /// build can gain new scenes without reinstalling the plug-in. The
+    /// environment override is also useful for offline smoke tests.
+    static var externalRoots: [URL] {
+        var roots: [URL] = []
+        if let override = ProcessInfo.processInfo.environment["SNOOPY_MEDIA_ROOT"],
+           !override.isEmpty {
+            roots.append(URL(fileURLWithPath: (override as NSString).expandingTildeInPath))
+        }
+        let userSupport = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+        roots.append(
+            userSupport.appendingPathComponent("Snoopy", isDirectory: true)
+                .appendingPathComponent("Assets", isDirectory: true)
+                .appendingPathComponent("Resolved", isDirectory: true)
+        )
+        if let processSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first, processSupport.standardizedFileURL != userSupport.standardizedFileURL {
+            roots.append(
+                processSupport.appendingPathComponent("Snoopy", isDirectory: true)
+                    .appendingPathComponent("Assets", isDirectory: true)
+                    .appendingPathComponent("Resolved", isDirectory: true)
+            )
+        }
+        return roots
+    }
+
+    static func resolve(fileName: String, bundledDirectory: URL) -> URL? {
+        let safeAssetDirectory = bundledDirectory.lastPathComponent
+        let safeFileName = URL(fileURLWithPath: fileName).lastPathComponent
+        guard !safeAssetDirectory.isEmpty, !safeFileName.isEmpty else { return nil }
+        for root in externalRoots {
+            let candidate = root.appendingPathComponent(
+                safeAssetDirectory, isDirectory: true
+            ).appendingPathComponent(safeFileName)
+            if isRegularFile(candidate) { return candidate }
+        }
+        let bundled = bundledDirectory.appendingPathComponent(safeFileName)
+        return isRegularFile(bundled) ? bundled : nil
+    }
+
+    private static func isRegularFile(_ url: URL) -> Bool {
+        let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        return values?.isRegularFile == true && values?.isSymbolicLink != true
+    }
+}
+
+struct AnnualWindow: Codable, Equatable, Hashable {
+    let startMonth: Int
+    let startDay: Int
+    let endMonth: Int
+    let endDay: Int
+
+    func contains(_ date: Date, calendar: Calendar = .current) -> Bool {
+        let components = calendar.dateComponents([.month, .day], from: date)
+        guard let month = components.month, let day = components.day else { return false }
+        let value = month * 100 + day
+        let start = startMonth * 100 + startDay
+        let end = endMonth * 100 + endDay
+        // Apple's quarterly windows meet on the same boundary day. Several
+        // date-specific scenes (notably Halloween on October 31) live in the
+        // window that ends that day, so both endpoints must remain available.
+        if start < end { return value >= start && value <= end }
+        return value >= start || value <= end
+    }
+}
+
+struct AssetAvailability: Equatable {
+    var isYearRound = true
+    var annualWindows: Set<AnnualWindow> = []
+
+    func contains(_ date: Date, calendar: Calendar = .current) -> Bool {
+        isYearRound || annualWindows.contains { $0.contains(date, calendar: calendar) }
+    }
+}
 
 struct RelevancyFacts: Codable, Equatable {
     var events: Set<String> = []
@@ -82,13 +165,21 @@ struct SpriteDescriptor {
 
     var frameCount: Int { max(1, endFrame - startFrame + 1) }
     var movieURL: URL? {
-        let url = directoryURL.appendingPathComponent(baseName).appendingPathExtension("mov")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        MediaLibrary.resolve(fileName: "\(baseName).mov", bundledDirectory: directoryURL)
     }
     func frameURL(_ frame: Int) -> URL? {
         let number = String(format: "%0*d", digitCount, frame)
-        let url = directoryURL.appendingPathComponent("\(baseName)_\(number).heic")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        return MediaLibrary.resolve(
+            fileName: "\(baseName)_\(number).heic", bundledDirectory: directoryURL
+        )
+    }
+    var hasPlayableMedia: Bool {
+        switch mediaType {
+        case .video:
+            return movieURL != nil
+        case .frameSequence:
+            return frameURL(startFrame) != nil && frameURL(endFrame) != nil
+        }
     }
 }
 
@@ -102,12 +193,18 @@ struct AssetRecord {
     let kind: AssetKind
     let directoryURL: URL
     let sourcePriority: Int
+    var availability: AssetAvailability
     let sprites: [SpriteDescriptor]
     let relevancy: RelevancyRecord
     let startPoseID: String?
     let endPoseID: String?
-    let transitionCategoryIDs: Set<String>
-    let transitionPairIDs: Set<String>
+    let transitionCategoryIDs: [String]
+    let transitionPairIDs: [String]
+    let hideCharacterPoseIDs: [String]
+    let revealCharacterPoseIDs: [String]
+    let transitionPhase: SceneTransitionPhase?
+    let hideTransitionParametersID: String?
+    let revealTransitionParametersID: String?
     let preventsIdleSceneChange: Bool
     let sceneOffset: CGPoint
     let ignoresSceneOffset: Bool
@@ -117,6 +214,10 @@ struct AssetRecord {
     let excludedPalettes: Set<String>
     let excludedVisitors: Set<String>
     let palette: Palette?
+
+    var hasPlayableMedia: Bool {
+        sprites.isEmpty || sprites.allSatisfy(\.hasPlayableMedia)
+    }
 }
 
 enum OfficialTransitionStyle: String, CaseIterable {
@@ -124,9 +225,14 @@ enum OfficialTransitionStyle: String, CaseIterable {
 }
 
 struct TransitionChoice {
+    let categoryID: String
     let pairID: String
     let style: OfficialTransitionStyle
     let preventsIdleSceneChange: Bool
+    let hideCharacterPose: AssetRecord?
+    let revealCharacterPose: AssetRecord?
+    let hideParameters: AssetRecord?
+    let revealParameters: AssetRecord?
 }
 
 struct IdleComposition {

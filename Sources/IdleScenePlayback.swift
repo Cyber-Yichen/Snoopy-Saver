@@ -6,6 +6,7 @@ final class IdleScenePlayback {
     let composition: IdleComposition
     let targetDuration: TimeInterval
     var onFinished: (() -> Void)?
+    var onApproachingFinish: (() -> Void)?
     private(set) var specialAnimationCount = 0
 
     private let catalog: AssetCatalog
@@ -76,6 +77,10 @@ final class IdleScenePlayback {
         activated = true; stopped = false
         scheduleCharacter(after: Double.random(in: 6...12))
         scheduleVisitor(after: Double.random(in: 3...9))
+        schedule(max(0.1, targetDuration - 6)) { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.onApproachingFinish?()
+        }
         schedule(targetDuration) { [weak self] in self?.finish() }
     }
 
@@ -91,6 +96,21 @@ final class IdleScenePlayback {
         permanent.forEach { $0.stop() }; character?.stop(); visitors.forEach { $0.stop() }
         permanent.removeAll(); visitors.removeAll(); character = nil
         prepared = false; activated = false
+    }
+
+    func playTransitionPose(_ asset: AssetRecord?, resumeBaseAfter: Bool) {
+        guard let asset else { return }
+        let old = character
+        let next = player(offset: composition.scene.sceneOffset)
+        next.onReady = { old?.stop() }
+        character = next
+        next.play(asset) { [weak self, weak next] in
+            guard let self, let next, self.character === next else { return }
+            if resumeBaseAfter, !self.stopped {
+                self.currentPoseID = self.composition.basePose.identifier
+                self.startBasePose(replacing: next)
+            }
+        }
     }
 
     private func startBasePose(replacing old: SpriteAssetPlayer?) {
