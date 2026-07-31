@@ -5,53 +5,40 @@ enum EventCalendar {
     private static let notable: [String: Set<String>] = [
         "02-11": ["peanutsCharlieBrownDay"], "07-20": ["peanutsMoonlanding"],
         "08-10": ["peanutsSnoopysBirthday"], "10-02": ["peanutsFirstComicStrip"],
-        "10-04": ["peanutsSnoopyDebut"], "11-20": ["peanutsCharlieBrownThanksgiving"],
+        "10-04": ["peanutsSnoopyDebut"], "11-26": ["peanutsGoodGrief"],
         "12-16": ["peanutsBeethovensBirthday"],
     ]
-    private static let fixed: [String: String] = [
-        "01-01":"newYearsDay", "02-14":"valentinesDay", "04-01":"aprilFoolsDay",
-        "04-22":"earthDay", "07-04":"fourthOfJuly", "08-19":"aviationDay",
-        "10-31":"halloween", "12-24":"christmasEve", "12-25":"christmas",
-        "12-31":"newYearsEve", "03-20":"startOfSpring", "06-21":"startOfSummer",
-        "09-22":"startOfFall", "12-21":"startOfWinter",
-    ]
-    static let dateSpecificEventNames: Set<String> = Set(
-        notable.values.flatMap { $0 }
-    ).union(fixed.values).union([
-        "thanksgiving", "mothersDay", "fathersDay", "lunarNewYear",
-    ])
-
-    static func dateSpecificEvents(on date: Date, calendar: Calendar = .current) -> Set<String> {
+    static func specialEvents(on date: Date, calendar: Calendar = .current) -> Set<String> {
         let key = String(format: "%02d-%02d", calendar.component(.month, from: date), calendar.component(.day, from: date))
         var result = notable[key] ?? []
-        if let event = fixed[key] { result.insert(event) }
         if isNthWeekday(date, month: 11, weekday: 5, ordinal: 4, calendar: calendar) {
-            result.insert("thanksgiving")
             result.insert("peanutsCharlieBrownThanksgiving")
         }
-        if isNthWeekday(date, month: 5, weekday: 1, ordinal: 2, calendar: calendar) {
-            result.insert("mothersDay")
-        }
-        if isNthWeekday(date, month: 6, weekday: 1, ordinal: 3, calendar: calendar) {
-            result.insert("fathersDay")
-        }
-        var chineseCalendar = Calendar(identifier: .chinese)
-        chineseCalendar.timeZone = calendar.timeZone
-        let chinese = chineseCalendar.dateComponents([.month, .day], from: date)
-        if chinese.month == 1 && chinese.day == 1 { result.insert("lunarNewYear") }
         return result
-    }
-    static func specialEvents(on date: Date, calendar: Calendar = .current) -> Set<String> {
-        dateSpecificEvents(on: date, calendar: calendar)
     }
     static func activeEvents(on date: Date, calendar: Calendar = .current) -> Set<String> {
         let month = calendar.component(.month, from: date), day = calendar.component(.day, from: date)
-        var result = dateSpecificEvents(on: date, calendar: calendar)
+        var result = specialEvents(on: date, calendar: calendar)
+        let fixed: [String: String] = [
+            "01-01":"newYearsDay", "02-14":"valentinesDay", "04-01":"aprilFoolsDay",
+            "04-22":"earthDay", "07-04":"fourthOfJuly", "08-19":"aviationDay",
+            "10-31":"halloween", "12-24":"christmasEve", "12-25":"christmas", "12-31":"newYearsEve",
+        ]
+        let key = String(format: "%02d-%02d", month, day)
+        if let event = fixed[key] { result.insert(event) }
         if month == 10 { result.insert("halloweenSeason") }
-        if month == 11 { result.insert("thanksgivingSeason") }
         if month == 12 && day <= 26 { result.insert("christmasSeason") }
+        if isNthWeekday(date, month: 11, weekday: 5, ordinal: 4, calendar: calendar) { result.insert("thanksgiving") }
+        if isNthWeekday(date, month: 5, weekday: 1, ordinal: 2, calendar: calendar) { result.insert("mothersDay") }
+        if isNthWeekday(date, month: 6, weekday: 1, ordinal: 3, calendar: calendar) { result.insert("fathersDay") }
         switch month { case 3...5: result.insert("spring"); case 6...8: result.insert("summer");
         case 9...11: result.insert("fall"); default: result.insert("winter") }
+        if key == "03-20" { result.insert("startOfSpring") }
+        if key == "06-21" { result.insert("startOfSummer") }
+        if key == "09-22" { result.insert("startOfFall") }
+        if key == "12-21" { result.insert("startOfWinter") }
+        let chinese = Calendar(identifier: .chinese).dateComponents([.month, .day], from: date)
+        if chinese.month == 1 && chinese.day == 1 { result.insert("lunarNewYear") }
         return result
     }
     private static func isNthWeekday(_ date: Date, month: Int, weekday: Int, ordinal: Int, calendar: Calendar) -> Bool {
@@ -114,9 +101,6 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     }
     func start() {
         onUpdate?()
-        if ProcessInfo.processInfo.environment["SNOOPY_DISABLE_ENVIRONMENT_IO"] == "1" {
-            return
-        }
         if manager.authorizationStatus == .notDetermined { manager.requestWhenInUseAuthorization() }
         else if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways { manager.requestLocation() }
         else { fetch(fallbackLocation()) }

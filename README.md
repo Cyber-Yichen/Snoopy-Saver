@@ -23,7 +23,7 @@ Snoopy Saver 的核心目标，是把 tvOS 中的史努比屏幕保护程序尽�
 
 - 从 tvOS 26.5 模拟器识别并适配完整的场景目录；
 - 重建多图层 IdleScene、半色调背景和角色动作衔接；
-- 解析并复现 16 个官方转场分类、13 个转场配对和五种视觉样式，并让转场结束与全屏动画结尾对齐；
+- 复现五类官方转场，并让转场结束与全屏动画结尾对齐；
 - 支持节日、史努比生日、时间段、天气和日常活动等特殊内容；
 - 提供同时兼容 Apple Silicon 与 Intel Mac 的通用屏保构建。
 
@@ -36,12 +36,10 @@ Snoopy Saver 的核心目标，是把 tvOS 中的史努比屏幕保护程序尽�
 | 全屏故事动画 | 65 个 ActiveScene |
 | 多图层休闲场景 | 39 个 IdleScene |
 | 环境调色板 | 84 套日期、时间与天气配色 |
-| 官方转场 | 16 个场景分类、13 个条件配对；横向、时钟、圆形、思考气泡、睡梦气泡 5 种样式 |
-| 特殊内容 | 节日、季节、纪念日、日常作息、天气、日出日落与月相等 |
+| 官方转场 | 5 类：横向、时钟、圆形、思考气泡、睡梦气泡 |
+| 特殊内容 | 节日、季节、史努比生日、日出日落、天气与月相等 |
 
 屏保启动时有相同概率进入全屏动画或多图层场景。IdleScene 通常持续 20–60 秒，期间史努比会更换动作，Woodstock 和其他访客也可能出现，随后插播一段全屏动画。无声音、无时钟和文字叠加。
-
-日期主题覆盖四季、圣诞节/平安夜、万圣节、感恩节、新年、情人节、农历新年、地球日、航空日、父亲节、母亲节、美国独立日，以及登月、首篇 Peanuts 漫画、Snoopy 首次登场、Snoopy 生日和贝多芬生日等纪念日。作息主题覆盖早晨、上学/上班、早午餐、午餐、下午、晚餐、睡前和深夜；天气主题覆盖晴朗、雾、风、雨、雷暴、冰冻和雪。
 
 ### 不同时间与季节
 
@@ -66,7 +64,7 @@ Snoopy Saver 的核心目标，是把 tvOS 中的史努比屏幕保护程序尽�
 
 <sub>测试日期：2026-08-10，Asia/Shanghai；截图来自全屏生日场景。</sub>
 
-> 本仓库只包含屏保实现源码、构建/安装/验证脚本和设置缩略图，不包含素材获取代码、实现分析记录、用于运行的 Apple 或 Peanuts 媒体，也不提交构建好的 `.saver`。README 中的少量低分辨率截图仅用于功能展示与测试记录。
+> 本仓库只包含屏保实现源码、构建/安装脚本和设置缩略图，不包含素材获取代码、测试工具、实现分析记录、用于运行的 Apple 或 Peanuts 媒体，也不提交构建好的 `.saver`。README 中的少量低分辨率截图仅用于功能展示与测试记录。
 
 ## 工作方式
 
@@ -76,10 +74,8 @@ flowchart TD
     B --> C{首次场景 50 / 50}
     C --> D[IdleScene 多图层场景]
     C --> E[ActiveScene 全屏动画]
-    D --> F[日期 / 时间 / 天气相关性评分]
-    F --> J[最近播放与频率衰减]
-    J --> K[最高分并列时随机]
-    K --> G[角色动作、访客与环境效果]
+    D --> F[日期 / 时间 / 天气 / 近期播放评分]
+    F --> G[角色动作、访客与环境效果]
     G -->|20–60 秒| E
     E --> H[提前预载下一组 IdleScene]
     H --> I[官方转场与视频结尾对齐]
@@ -108,50 +104,13 @@ flowchart TD
 Scripts/build_saver.sh
 ```
 
-本仓库不提供 Apple 素材、素材获取下载器、解密工具或获取教程。完整构建要求使用者自行准备其有权访问的本地素材，并放入构建脚本期望的 `LocalAssets/` 目录。只验证代码编译、不打包媒体时可运行：
+本仓库不提供素材、下载器、解密工具或素材获取教程。完整构建要求使用者自行准备其有权访问的本地素材，并放入构建脚本期望的 `LocalAssets/` 目录。只验证代码编译、不打包媒体时可运行：
 
 ```bash
 Scripts/build_saver.sh --code-only
 ```
 
 所有本地媒体路径都被 `.gitignore` 排除。
-
-### 1080p 与 CDN 精简版
-
-仓库提供的变体脚本只处理使用者已经合法准备的本地素材，不负责从 Apple 获取内容。完整低清流水线会先按 Asset ID 只保留一个首选版本。普通视频由 FFmpeg 转为最高 1920×1080、HEVC Main 8-bit、无音轨的低码率文件；Apple HEVC Alpha 角色/访客视频不能由普通 libx265 正确处理，因此随后在 macOS 上优先恢复 Apple 原生 1080p 文件，只有 4K 来源时才用 AVFoundation 的 HEVC-with-Alpha 编码器缩放。最后再用 ImageIO 处理超出 1080p 的 HEIC Alpha 帧：
-
-```bash
-python3 Scripts/build_lowres_assets.py LocalAssets .tmp/lowres-assets
-Scripts/preserve_alpha_movies.sh LocalAssets .tmp/lowres-assets
-Scripts/downscale_heic_assets.sh .tmp/lowres-assets
-Scripts/validate_alpha_movies.sh .tmp/lowres-assets
-python3 Scripts/validate_prepared_assets.py .tmp/lowres-assets --lowres
-```
-
-普通 MOV 步骤需要 FFmpeg；本项目的发布流水线在 Linux VM 中运行它，因此不要求在 macOS 上安装 Homebrew。Alpha MOV 与 HEIC 步骤使用 Xcode 自带的 Swift、AVFoundation 和系统 ImageIO。tvOS 26.5 测试集中的 258 段透明 MOV 会逐文件检查 `ContainsAlphaChannel`，并限制在 1920×1080 以内。
-
-CDN 精简版保留少量可离线播放的视频和完整元数据，其余低清视频写入带文件大小和 SHA-256 的清单：
-
-```bash
-python3 Scripts/build_cdn_lite_assets.py \
-  .tmp/lowres-assets .tmp/cdn-lite \
-  --cdn-base-url https://cdn.snoopy.bdmzw.top/media/1.1-r2 \
-  --payload-output .tmp/cdn-payload
-Scripts/build_variants.sh .tmp/lowres-assets .tmp/cdn-lite
-```
-
-构建产物位于 `.build/Variants/`：标准版、1080p 版、CDN 精简版，以及可单独分发的清单和下载脚本。
-`.tmp/cdn-payload` 可原样发布到源站 `/www/wwwroot/snoopy.bdmzw.top/media/1.1-r2`。
-发布后，同一版本的远程清单位于 `https://cdn.snoopy.bdmzw.top/media/1.1-r2/cdn-manifest.json`。
-
-CDN 精简版每次启动都会在后台检查同源 HTTPS 清单，并把缺失或变化的媒体下载到固定目录 `~/Library/Application Support/Snoopy/Assets/Resolved`。本地文件的大小、SHA-256 和记录的修改时间与服务器一致时会直接复用，不重复下载；新文件只有在校验完成后才原子替换。多显示器同时启动时会合并短时间内的重复检查。
-
-也可以手动运行同样受路径和 SHA-256 约束的下载器：
-
-```bash
-python3 Scripts/download_cdn_assets.py cdn-manifest.json \
-  --base-url https://cdn.snoopy.bdmzw.top/media/1.1-r2
-```
 
 安装本地构建：
 
@@ -163,16 +122,14 @@ Scripts/install_saver.sh
 
 发布前测试包括：
 
-- AddressSanitizer 构建完成 12 次快速场景切换，无越界访问或释放后使用；
-- 普通构建完成 20 次快速强制切换，根图层无持续累积，停止后清空；
-- 原生验证 258 段 HEVC Alpha 视频均保留透明通道且不超过 1920×1080，CDN 实际返回样本也通过像素级透明度检查；
-- CDN 更新器确认首次下载后，第二次运行对一致文件执行零重复下载；
-- HEIC 解码缓存限制为 256 MB；官方转场帧按阶段释放，屏保停止时清空全部媒体缓存；
+- AddressSanitizer 播放与图层交接测试通过；
+- 12 次连续强制场景切换无崩溃、黑屏或图层累积；
+- HEIC 缓存限制为 192 MB，并在屏保停止时主动清空；
 - 播放器、预加载、通知、KVO、时间观察器、定位和网络会话均显式清理；
 - 运行时代码不执行外部命令，不包含第三方二进制或可执行资源；
 - 天气请求仅通过 HTTPS 访问 Open-Meteo，并使用无 Cookie、无磁盘缓存、带超时和响应大小限制的临时会话。
 
-本轮修复后的 1440×900 测试窗口内，1080p 构建 6 次强制切换峰值常驻内存为 746 MB，CDN 精简构建 4 次切换为 764 MB；停止后所有根图层均清空。不同素材、分辨率、显示器和 macOS 版本会产生不同结果。
+测试中的常驻内存约为 295 MB，4K 双场景转场峰值约为 568 MB；停止后所有根图层均清空。不同素材、分辨率和 macOS 版本会产生不同结果。
 
 ## 参与贡献
 

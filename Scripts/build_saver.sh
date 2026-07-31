@@ -4,57 +4,43 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 TOOLCHAIN="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain"
 SWIFT_LIB="$TOOLCHAIN/usr/lib/swift/macosx"
-BUILD="${SNOOPY_BUILD_DIR:-$ROOT/.build/SnoopyScreenSaver}"
-[[ "$BUILD" == /* ]] || BUILD="$ROOT/$BUILD"
+BUILD="$ROOT/.build/SnoopyScreenSaver"
 BUNDLE="$BUILD/SnoopyScreenSaver.saver"
-MODULE_CACHE="$ROOT/.build/ModuleCache"
-ASSET_ROOT="${SNOOPY_ASSET_ROOT:-$ROOT/LocalAssets}"
-ARCHS=( ${SNOOPY_ARCHS:-arm64 x86_64} )
-SWIFT_EXTRA=( -parse-as-library )
-CLANG_EXTRA=( -bundle )
-if [[ "${SNOOPY_SANITIZER:-}" == "address" ]]; then
-  SWIFT_EXTRA+=( -sanitize=address )
-  CLANG_EXTRA+=( -fsanitize=address )
-fi
 WITH_ASSETS=1
 [[ "${1:-}" == "--code-only" ]] && WITH_ASSETS=0
-if [[ -z "$BUILD" || "$BUILD" == "/" || "$BUILD" == "$HOME" || "$BUILD" == "$ROOT" ]]; then
-  echo "Refusing unsafe build directory: $BUILD" >&2
-  exit 2
-fi
 rm -rf "$BUILD"
-mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources" "$MODULE_CACHE"
-BINARIES=()
-for ARCH in "${ARCHS[@]}"; do
+mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+for ARCH in arm64 x86_64; do
   mkdir -p "$BUILD/$ARCH"
   xcrun swiftc -swift-version 5 -target "$ARCH-apple-macosx12.0" -sdk "$SDK" \
-    -module-cache-path "$MODULE_CACHE" \
-    "${SWIFT_EXTRA[@]}" \
-    -whole-module-optimization -emit-object -module-name SnoopyScreenSaver \
+    -parse-as-library -whole-module-optimization -emit-object -module-name SnoopyScreenSaver \
     "$ROOT"/Sources/*.swift -o "$BUILD/$ARCH/SnoopyScreenSaver.o"
-  xcrun clang -target "$ARCH-apple-macosx12.0" -isysroot "$SDK" \
-    "${CLANG_EXTRA[@]}" \
+  xcrun clang -target "$ARCH-apple-macosx12.0" -isysroot "$SDK" -bundle \
     "$BUILD/$ARCH/SnoopyScreenSaver.o" -L"$SDK/usr/lib/swift" -L/usr/lib/swift -L"$SWIFT_LIB" \
     -lswiftCore -lswiftFoundation -lswiftAppKit -lswiftAVFoundation -lswiftCoreLocation \
     -framework AppKit -framework AVFoundation -framework CoreLocation -framework ImageIO \
-    -framework CryptoKit -framework QuartzCore -framework ScreenSaver \
-    -o "$BUILD/$ARCH/SnoopyScreenSaver"
-  BINARIES+=( "$BUILD/$ARCH/SnoopyScreenSaver" )
+    -framework QuartzCore -framework ScreenSaver -o "$BUILD/$ARCH/SnoopyScreenSaver"
 done
-if [[ "${#BINARIES[@]}" -eq 1 ]]; then
-  cp "${BINARIES[0]}" "$BUNDLE/Contents/MacOS/SnoopyScreenSaver"
-else
-  xcrun lipo -create "${BINARIES[@]}" \
-    -output "$BUNDLE/Contents/MacOS/SnoopyScreenSaver"
-fi
+xcrun lipo -create "$BUILD/arm64/SnoopyScreenSaver" "$BUILD/x86_64/SnoopyScreenSaver" \
+  -output "$BUNDLE/Contents/MacOS/SnoopyScreenSaver"
 cp "$ROOT/Info.plist" "$BUNDLE/Contents/Info.plist"
 if [[ "$WITH_ASSETS" -eq 1 ]]; then
-  "$ROOT/Scripts/prepare_assets.sh" "$ASSET_ROOT" "$BUNDLE/Contents/Resources"
+  mkdir -p "$BUNDLE/Contents/Resources/Assets/Optional"
+  cp -cR "$ROOT/LocalAssets/DefaultAssetBundle" "$BUNDLE/Contents/Resources/Assets/"
+  cp -cR "$ROOT/LocalAssets/DefaultAssetBundleV2" "$BUNDLE/Contents/Resources/Assets/"
+  if compgen -G "$ROOT/LocalAssets/OptionalDownloads/expanded/*" >/dev/null; then
+    for PACKAGE in "$ROOT"/LocalAssets/OptionalDownloads/expanded/*; do
+      cp -cR "$PACKAGE" "$BUNDLE/Contents/Resources/Assets/Optional/"
+    done
+  fi
+  if [[ -f "$ROOT/LocalAssets/optional-assets.json" ]]; then
+    cp "$ROOT/LocalAssets/optional-assets.json" "$BUNDLE/Contents/Resources/optional-assets.json"
+  fi
+  cp "$ROOT/LocalAssets/FrameworkResources/halftone_pattern.png" "$BUNDLE/Contents/Resources/halftone_pattern.png"
 fi
 if [[ -f "$ROOT/Assets/thumbnail.png" ]]; then
   cp "$ROOT/Assets/thumbnail.png" "$BUNDLE/Contents/Resources/thumbnail.png"
   cp "$ROOT/Assets/thumbnail@2x.png" "$BUNDLE/Contents/Resources/thumbnail@2x.png"
 fi
-xattr -cr "$BUNDLE"
 codesign --force --sign - --timestamp=none "$BUNDLE"
 echo "$BUNDLE"

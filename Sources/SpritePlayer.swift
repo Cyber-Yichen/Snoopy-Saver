@@ -8,7 +8,7 @@ import QuartzCore
 /// still leaves the expensive HEIF decompression for `CALayer` to perform.
 /// The immediate thumbnail below guarantees that layers only ever receive
 /// decoded pixels. A bounded shared cache and two workers limit memory and CPU.
-final class FrameDecoder {
+private final class FrameDecoder {
     private final class Entry {
         let image: CGImage
         let cost: Int
