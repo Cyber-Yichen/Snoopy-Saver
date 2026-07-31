@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-07-31T19:35:00+08:00",
+  "repository": {
+    "name": "Snoopy-Saver",
+    "stableBranch": "main",
+    "stableHeadAtCapture": "ff6b03d1b05b6be17bed6f1481a361413904682d",
+    "productIntegrationBranch": "test/official-theme-parity-alpha-r2",
+    "productIntegrationHeadAtCapture": "68cb156702eb38a735db88b216ebd794378098ef",
+    "agentHarnessBranch": "test/harness-engineering",
+    "latestPublishedTag": "V1.1.0"
+  },
+  "product": {
+    "shortVersion": "1.1",
+    "internalBuild": "4",
+    "minimumMacOS": "12.0",
+    "architectures": [
+      "arm64",
+      "x86_64"
+    ]
+  },
+  "variants": {
+    "standard": {
+      "bundleIdentifier": "local.snoopy.ScreenSaver",
+      "principalClass": "SnoopyScreenSaverView",
+      "swiftModule": "SnoopyScreenSaver",
+      "mediaPolicy": "bundled-first"
+    },
+    "1080p": {
+      "bundleIdentifier": "local.snoopy.ScreenSaver.1080p",
+      "principalClass": "Snoopy1080ScreenSaverView",
+      "swiftModule": "SnoopyScreenSaver1080p",
+      "mediaPolicy": "bundled-first"
+    },
+    "cdn-lite": {
+      "bundleIdentifier": "local.snoopy.ScreenSaver.CDNLite",
+      "principalClass": "SnoopyCDNLiteScreenSaverView",
+      "swiftModule": "SnoopyScreenSaverCDNLite",
+      "mediaPolicy": "bundled-then-verified-cache"
+    }
+  },
+  "frozenBehavior": {
+    "coldStartIdleProbability": 0.5,
+    "idleDurationSeconds": {
+      "minimum": 20,
+      "maximum": 60
+    },
+    "audio": false,
+    "clockOrTextOverlay": false,
+    "transitionStyles": [
+      "clockWipe",
+      "horizontalWipe",
+      "circularWipe",
+      "thoughtBubble",
+      "sleepingDreamBubble"
+    ]
+  },
+  "forbiddenReadPaths": [
+    "/Users/yichen/Documents/Git/Snoopy-archive-20260711",
+    "/private/tmp/SnoopyScreenSaver-derived-archive-20260711"
+  ],
+  "forbiddenTrackedContent": {
+    "prefixes": [
+      ".build/",
+      "LocalAssets/",
+      "Releases/"
+    ],
+    "suffixes": [
+      ".heic",
+      ".mov",
+      ".saver",
+      ".tar.encrypted"
+    ]
+  },
+  "requiredAgentSequence": [
+    "read-project-state",
+    "run-preflight",
+    "inspect-git-state",
+    "identify-media-provenance",
+    "make-scoped-change",
+    "run-routed-gates",
+    "audit-tracked-media",
+    "handoff-with-evidence"
+  ]
+}
