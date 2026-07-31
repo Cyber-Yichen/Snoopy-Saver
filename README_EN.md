@@ -146,6 +146,10 @@ After publication, the versioned remote manifest is available at `https://cdn.sn
 
 On every launch, the CDN-lite saver checks the same-origin HTTPS manifest in the background and stores missing or changed media at `~/Library/Application Support/Snoopy/Assets/Resolved`. A local file whose size, SHA-256, and recorded modification time still match is reused without another download. New files are installed atomically only after verification, and a short throttle coalesces simultaneous multi-display checks.
 
+Full 4K and 1080p bundles always prefer their bundled media and fall back to the CDN cache only for files absent from the bundle, preventing stale cache files from overriding transparent movies. All three build variants use distinct bundle identifiers, Swift module names, and Objective-C principal classes so the macOS screen-saver helper can discover them safely in one process.
+
+The CDN edition records startup, manifest verification, downloads and cache reuse, resolved media sources, scenes, transitions, and playback errors. The log rotates at 5 MB and keeps one backup. Run `Scripts/collect_cdn_logs.sh` to copy it to the Desktop for an Issue report. Its sandbox path is normally `~/Library/Containers/com.apple.ScreenSaver.Engine.legacyScreenSaver/Data/Library/Logs/Snoopy/CDN-Lite.log`.
+
 The same path- and SHA-256-restricted downloader is also available for manual use:
 
 ```bash

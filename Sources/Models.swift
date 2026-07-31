@@ -58,14 +58,46 @@ enum MediaLibrary {
         let safeAssetDirectory = bundledDirectory.lastPathComponent
         let safeFileName = URL(fileURLWithPath: fileName).lastPathComponent
         guard !safeAssetDirectory.isEmpty, !safeFileName.isEmpty else { return nil }
+        let shouldLogResolution = URL(fileURLWithPath: safeFileName)
+            .pathExtension.lowercased() == "mov"
+        // Full and 1080p bundles must not be silently overridden by media
+        // downloaded by a previously installed CDN-lite build. An old
+        // non-alpha cache would otherwise turn transparent IdleScene sprites
+        // into black rectangles even when the bundled movie is correct.
+        let bundled = bundledDirectory.appendingPathComponent(safeFileName)
+        if isRegularFile(bundled) {
+            if shouldLogResolution {
+                SnoopyDiagnostics.shared.logOnce(
+                    key: "media:bundled:\(safeAssetDirectory)/\(safeFileName)",
+                    category: "media",
+                    message: "bundled \(safeAssetDirectory)/\(safeFileName)"
+                )
+            }
+            return bundled
+        }
         for root in externalRoots {
             let candidate = root.appendingPathComponent(
                 safeAssetDirectory, isDirectory: true
             ).appendingPathComponent(safeFileName)
-            if isRegularFile(candidate) { return candidate }
+            if isRegularFile(candidate) {
+                if shouldLogResolution {
+                    SnoopyDiagnostics.shared.logOnce(
+                        key: "media:external:\(safeAssetDirectory)/\(safeFileName)",
+                        category: "media",
+                        message: "cache fallback \(safeAssetDirectory)/\(safeFileName)"
+                    )
+                }
+                return candidate
+            }
         }
-        let bundled = bundledDirectory.appendingPathComponent(safeFileName)
-        return isRegularFile(bundled) ? bundled : nil
+        if shouldLogResolution {
+            SnoopyDiagnostics.shared.logOnce(
+                key: "media:missing:\(safeAssetDirectory)/\(safeFileName)",
+                category: "media",
+                message: "missing \(safeAssetDirectory)/\(safeFileName)"
+            )
+        }
+        return nil
     }
 
     private static func isRegularFile(_ url: URL) -> Bool {

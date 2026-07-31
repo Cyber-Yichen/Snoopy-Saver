@@ -12,6 +12,33 @@ ASSET_ROOT="${SNOOPY_ASSET_ROOT:-$ROOT/LocalAssets}"
 ARCHS=( ${SNOOPY_ARCHS:-arm64 x86_64} )
 SWIFT_EXTRA=( -parse-as-library )
 CLANG_EXTRA=( -bundle )
+VARIANT="${SNOOPY_VARIANT:-standard}"
+case "$VARIANT" in
+  standard)
+    MODULE_NAME="SnoopyScreenSaver"
+    BUNDLE_ID="local.snoopy.ScreenSaver"
+    PRINCIPAL_CLASS="SnoopyScreenSaverView"
+    DISPLAY_NAME="Snoopy"
+    ;;
+  1080p)
+    SWIFT_EXTRA+=( -D SNOOPY_VARIANT_1080P )
+    MODULE_NAME="SnoopyScreenSaver1080p"
+    BUNDLE_ID="local.snoopy.ScreenSaver.1080p"
+    PRINCIPAL_CLASS="Snoopy1080ScreenSaverView"
+    DISPLAY_NAME="Snoopy 1080p"
+    ;;
+  cdn-lite)
+    SWIFT_EXTRA+=( -D SNOOPY_VARIANT_CDN_LITE )
+    MODULE_NAME="SnoopyScreenSaverCDNLite"
+    BUNDLE_ID="local.snoopy.ScreenSaver.CDNLite"
+    PRINCIPAL_CLASS="SnoopyCDNLiteScreenSaverView"
+    DISPLAY_NAME="Snoopy CDN"
+    ;;
+  *)
+    echo "Unknown SNOOPY_VARIANT: $VARIANT" >&2
+    exit 2
+    ;;
+esac
 if [[ "${SNOOPY_SANITIZER:-}" == "address" ]]; then
   SWIFT_EXTRA+=( -sanitize=address )
   CLANG_EXTRA+=( -fsanitize=address )
@@ -30,7 +57,7 @@ for ARCH in "${ARCHS[@]}"; do
   xcrun swiftc -swift-version 5 -target "$ARCH-apple-macosx12.0" -sdk "$SDK" \
     -module-cache-path "$MODULE_CACHE" \
     "${SWIFT_EXTRA[@]}" \
-    -whole-module-optimization -emit-object -module-name SnoopyScreenSaver \
+    -whole-module-optimization -emit-object -module-name "$MODULE_NAME" \
     "$ROOT"/Sources/*.swift -o "$BUILD/$ARCH/SnoopyScreenSaver.o"
   xcrun clang -target "$ARCH-apple-macosx12.0" -isysroot "$SDK" \
     "${CLANG_EXTRA[@]}" \
@@ -48,6 +75,10 @@ else
     -output "$BUNDLE/Contents/MacOS/SnoopyScreenSaver"
 fi
 cp "$ROOT/Info.plist" "$BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :NSPrincipalClass $PRINCIPAL_CLASS" "$BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$BUNDLE/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName $DISPLAY_NAME" "$BUNDLE/Contents/Info.plist"
 if [[ "$WITH_ASSETS" -eq 1 ]]; then
   "$ROOT/Scripts/prepare_assets.sh" "$ASSET_ROOT" "$BUNDLE/Contents/Resources"
 fi

@@ -146,6 +146,10 @@ Scripts/build_variants.sh .tmp/lowres-assets .tmp/cdn-lite
 
 CDN 精简版每次启动都会在后台检查同源 HTTPS 清单，并把缺失或变化的媒体下载到固定目录 `~/Library/Application Support/Snoopy/Assets/Resolved`。本地文件的大小、SHA-256 和记录的修改时间与服务器一致时会直接复用，不重复下载；新文件只有在校验完成后才原子替换。多显示器同时启动时会合并短时间内的重复检查。
 
+完整 4K/1080p 包始终优先使用包内素材，只有包内缺失的文件才会回退到 CDN 缓存，避免旧缓存覆盖透明视频。三个构建变体使用独立的 Bundle ID、Swift 模块名和运行时主类，可以安全地由 macOS 屏保辅助进程同时发现。
+
+CDN 版会记录启动、清单校验、下载/复用结果、实际媒体来源、场景、转场和播放错误。日志限制为 5 MB，并保留一份轮换备份；运行 `Scripts/collect_cdn_logs.sh` 可将当前日志复制到桌面，方便附在 Issue 中。屏保沙盒内的原始路径通常是 `~/Library/Containers/com.apple.ScreenSaver.Engine.legacyScreenSaver/Data/Library/Logs/Snoopy/CDN-Lite.log`。
+
 也可以手动运行同样受路径和 SHA-256 约束的下载器：
 
 ```bash

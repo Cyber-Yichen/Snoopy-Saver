@@ -407,6 +407,22 @@ struct ThemeSmokeTests {
         )
         let externalMovie = assetDirectory.appendingPathComponent("ExternalFixture.mov")
         try Data([0]).write(to: externalMovie)
+        let bundledDirectory = root.appendingPathComponent("BundleResources", isDirectory: true)
+            .appendingPathComponent("BundledFixture.icasset", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: bundledDirectory, withIntermediateDirectories: true
+        )
+        let bundledMovie = bundledDirectory.appendingPathComponent("BundledFixture.mov")
+        try Data([1]).write(to: bundledMovie)
+        let staleExternalDirectory = root.appendingPathComponent(
+            "BundledFixture.icasset", isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: staleExternalDirectory, withIntermediateDirectories: true
+        )
+        try Data([2]).write(
+            to: staleExternalDirectory.appendingPathComponent("BundledFixture.mov")
+        )
         let descriptor = SpriteDescriptor(
             baseName: "ExternalFixture",
             directoryURL: URL(fileURLWithPath: "/missing/ExternalFixture.icasset"),
@@ -425,5 +441,22 @@ struct ThemeSmokeTests {
             "external CDN media did not override a missing bundled file"
         )
         try require(descriptor.hasPlayableMedia, "external media was not considered playable")
+        let bundledDescriptor = SpriteDescriptor(
+            baseName: "BundledFixture",
+            directoryURL: bundledDirectory,
+            mediaType: .video,
+            phase: .oneShot,
+            assetSize: CGSize(width: 1920, height: 1080),
+            alignment: "center",
+            plane: "centerpiece",
+            loops: false,
+            startFrame: 0,
+            endFrame: 0,
+            digitCount: 2
+        )
+        try require(
+            bundledDescriptor.movieURL?.standardizedFileURL == bundledMovie.standardizedFileURL,
+            "external CDN media overrode a bundled file"
+        )
     }
 }

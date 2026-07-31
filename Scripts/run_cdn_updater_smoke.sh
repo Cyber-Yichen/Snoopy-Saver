@@ -47,6 +47,7 @@ Path("'"$BUNDLE"'/Contents/Resources/cdn-manifest.json").write_text(text)
 cp "$ROOT/Info.plist" "$BUNDLE/Contents/Info.plist"
 
 xcrun swiftc -swift-version 5 -parse-as-library \
+  "$ROOT/Sources/DiagnosticsLogger.swift" \
   "$ROOT/Sources/CDNMediaUpdater.swift" \
   "$ROOT/Tests/CDNUpdaterSmoke.swift" \
   -framework CryptoKit \
@@ -55,4 +56,6 @@ xcrun swiftc -swift-version 5 -parse-as-library \
 SNOOPY_CDN_ALLOW_HTTP_FOR_TESTS=1 \
 SNOOPY_CDN_MIN_CHECK_INTERVAL=0 \
 SNOOPY_CDN_DESTINATION="$DESTINATION" \
+SNOOPY_LOG_ROOT="$FIXTURE/logs" \
+SNOOPY_LOG_ROTATION_BYTES=1024 \
   "$BUILD/cdn-updater-smoke" "$BUNDLE" "$DESTINATION"

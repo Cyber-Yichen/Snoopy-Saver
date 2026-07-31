@@ -201,13 +201,17 @@ final class CDNMediaUpdater {
 
     func checkForUpdates(bundle: Bundle) {
         let environment = ProcessInfo.processInfo.environment
-        if Self.truthy(environment["SNOOPY_DISABLE_CDN_UPDATE"]) { return }
+        if Self.truthy(environment["SNOOPY_DISABLE_CDN_UPDATE"]) {
+            SnoopyDiagnostics.shared.log("cdn", "update disabled by environment")
+            return
+        }
         guard let bundledManifest = bundle.url(
             forResource: "cdn-manifest",
             withExtension: "json"
         ) else {
             return
         }
+        SnoopyDiagnostics.shared.log("cdn", "update check scheduled")
         let minimumInterval = max(
             0,
             Double(environment["SNOOPY_CDN_MIN_CHECK_INTERVAL"] ?? "") ?? 30
@@ -229,6 +233,7 @@ final class CDNMediaUpdater {
                 )
             } catch {
                 NSLog("Snoopy CDN update skipped: %@", String(describing: error))
+                SnoopyDiagnostics.shared.log("cdn", "update failed: \(error)")
             }
         }
     }
@@ -263,10 +268,14 @@ final class CDNMediaUpdater {
                 maximumBytes: 5 * 1024 * 1024
             )
             manifest = try decoder.decode(Manifest.self, from: remoteData)
+            SnoopyDiagnostics.shared.log("cdn", "remote manifest loaded")
         } catch {
             NSLog(
                 "Snoopy CDN manifest refresh failed; using bundled manifest: %@",
                 String(describing: error)
+            )
+            SnoopyDiagnostics.shared.log(
+                "cdn", "remote manifest failed; using bundled manifest: \(error)"
             )
             manifest = bootstrap
         }
@@ -279,6 +288,10 @@ final class CDNMediaUpdater {
         }
         let entries = try validatedEntries(manifest.files)
         let destination = try destinationRoot(environment: environment)
+        SnoopyDiagnostics.shared.log(
+            "cdn",
+            "sync start host=\(trustedHost) files=\(entries.count) destination=\(destination.path)"
+        )
         let receiptURL = destination
             .deletingLastPathComponent()
             .appendingPathComponent("cdn-state-v1.json")
@@ -322,6 +335,7 @@ final class CDNMediaUpdater {
                 )
             }
             try install(staging, at: destinationURL)
+            SnoopyDiagnostics.shared.log("cdn", "downloaded \(entry.path)")
             receipt.files[entry.path] = try receiptEntry(
                 for: destinationURL,
                 entry: entry
@@ -333,6 +347,10 @@ final class CDNMediaUpdater {
         NSLog(
             "Snoopy CDN media ready: %d downloaded, %d unchanged, %d total",
             downloaded, verified, entries.count
+        )
+        SnoopyDiagnostics.shared.log(
+            "cdn",
+            "media ready downloaded=\(downloaded) unchanged=\(verified) total=\(entries.count)"
         )
     }
 

@@ -3,7 +3,13 @@ import AVFoundation
 import QuartzCore
 import ScreenSaver
 
+#if SNOOPY_VARIANT_CDN_LITE
+@objc(SnoopyCDNLiteScreenSaverView)
+#elseif SNOOPY_VARIANT_1080P
+@objc(Snoopy1080ScreenSaverView)
+#else
 @objc(SnoopyScreenSaverView)
+#endif
 final class SnoopyScreenSaverView: ScreenSaverView {
     private final class WeakView {
         weak var value: SnoopyScreenSaverView?
@@ -73,6 +79,11 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         showBootstrap()
         environment.start()
         let bundle = Bundle(for: SnoopyScreenSaverView.self)
+        SnoopyDiagnostics.shared.start(bundle: bundle)
+        SnoopyDiagnostics.shared.log(
+            "lifecycle",
+            "start preview=\(isPreview) bundle=\(bundle.bundleIdentifier ?? "unknown")"
+        )
         CDNMediaUpdater.shared.checkForUpdates(bundle: bundle)
         if catalog != nil { playInitialScene(); return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -80,9 +91,12 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             DispatchQueue.main.async {
                 guard let self, self.sessionActive, self.generation == expected else { return }
                 switch result {
-                case .success(let catalog): self.catalog = catalog; self.playInitialScene()
+                case .success(let catalog):
+                    SnoopyDiagnostics.shared.log("catalog", "loaded")
+                    self.catalog = catalog; self.playInitialScene()
                 case .failure(let error):
                     NSLog("Snoopy Multi-Layer catalog error: %@", String(describing: error))
+                    SnoopyDiagnostics.shared.log("catalog", "load failed: \(error)")
                     // Retry once: ScreenSaverEngine may have raced a freshly
                     // replaced bundle on disk.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
@@ -216,6 +230,14 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         }
         idle = incoming
         active = nil
+        SnoopyDiagnostics.shared.log(
+            "scene",
+            "idle scene=\(incoming.composition.scene.identifier) "
+                + "pose=\(incoming.composition.basePose.identifier) "
+                + "palette=\(incoming.composition.palette?.identifier ?? "none") "
+                + "effect=\(incoming.composition.fullscreenEffect?.identifier ?? "none") "
+                + "duration=\(String(format: "%.1f", incoming.targetDuration))"
+        )
         root.addSublayer(incoming.container)
         incoming.start()
         if oldActive != nil {
@@ -223,6 +245,9 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         }
         incoming.tick()
         NSLog("Snoopy transition %@ (%@) Active->Idle", choice.style.rawValue, choice.pairID)
+        SnoopyDiagnostics.shared.log(
+            "transition", "active-to-idle \(choice.style.rawValue)/\(choice.pairID)"
+        )
         TransitionAnimator.reveal(
             incoming: incoming.container, over: oldActive?.container ?? oldIdle?.container ?? bootstrapLayer,
             style: choice.style, phase: .reveal, parameters: choice.revealParameters, in: bounds
@@ -264,8 +289,13 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         let scene = selection.scene
         let choice = selection.transition
         guard let sprite = scene.sprites.first, let url = sprite.movieURL else {
+            SnoopyDiagnostics.shared.log("scene", "active missing media id=\(scene.identifier)")
             return
         }
+        SnoopyDiagnostics.shared.log(
+            "scene",
+            "active id=\(scene.identifier) transition=\(choice.style.rawValue)/\(choice.pairID) file=\(url.lastPathComponent)"
+        )
         scorer.mark(scene, kind: "activeScene", at: snapshot.date)
         catalog.markTransitionChoice(choice, environment: snapshot, scorer: scorer)
         lastTransitionPairID = choice.pairID
@@ -296,6 +326,9 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         let entryChoice = isInitialScene ? fallbackTransition("initial-dissolve") : choice
         installObservers(item, playback: playback)
         NSLog("Snoopy transition %@ (%@) Idle->Active", entryChoice.style.rawValue, entryChoice.pairID)
+        SnoopyDiagnostics.shared.log(
+            "transition", "idle-to-active \(entryChoice.style.rawValue)/\(entryChoice.pairID)"
+        )
         let reveal = { [weak self, weak player] in
             guard let self, let player, self.active?.player === player else { return }
             let id = ObjectIdentifier(player)
@@ -330,6 +363,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         _ item: AVPlayerItem,
         playback: ActivePlayback
     ) {
+        let sceneID = playback.scene.identifier
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self, weak player = playback.player] _ in
@@ -340,6 +374,11 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         failureObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main
         ) { [weak self, weak player = playback.player] _ in
+            SnoopyDiagnostics.shared.log(
+                "player",
+                "active failed id=\(sceneID): "
+                    + "\(item.error?.localizedDescription ?? "unknown error")"
+            )
             guard let self, let player, self.active?.player === player,
                   let transition = self.active?.transition else { return }
             self.playIdle(transitionOverride: transition)
@@ -490,6 +529,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             return
         }
         sessionActive = false
+        SnoopyDiagnostics.shared.log("lifecycle", "stop")
         generation += 1
         removeObservers()
         watchdog?.cancel(); watchdog = nil

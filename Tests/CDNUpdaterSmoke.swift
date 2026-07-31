@@ -29,6 +29,7 @@ private struct CDNUpdaterSmoke {
         guard let bundle = Bundle(url: bundleURL) else {
             throw SmokeError.failed("unable to open fixture bundle")
         }
+        SnoopyDiagnostics.shared.start(bundle: bundle)
         let media = destination
             .appendingPathComponent("Fixture.icasset", isDirectory: true)
             .appendingPathComponent("Fixture.mov")
@@ -52,6 +53,24 @@ private struct CDNUpdaterSmoke {
         let secondModification = try modificationTime(media)
         guard firstModification == secondModification else {
             throw SmokeError.failed("unchanged media was downloaded again")
+        }
+        if let logRoot = ProcessInfo.processInfo.environment["SNOOPY_LOG_ROOT"] {
+            let log = URL(fileURLWithPath: logRoot, isDirectory: true)
+                .appendingPathComponent("CDN-Lite.log")
+            let text = try String(contentsOf: log, encoding: .utf8)
+            guard text.contains("media ready downloaded=1"),
+                  text.contains("media ready downloaded=0 unchanged=1") else {
+                throw SmokeError.failed("persistent CDN diagnostics were incomplete")
+            }
+            for index in 0..<30 {
+                SnoopyDiagnostics.shared.log(
+                    "rotation-smoke",
+                    "entry=\(index) \(String(repeating: "x", count: 96))"
+                )
+            }
+            guard FileManager.default.fileExists(atPath: log.path + ".1") else {
+                throw SmokeError.failed("persistent CDN diagnostics did not rotate")
+            }
         }
         print(
             "CDN updater smoke passed: first run downloaded 1 file; "

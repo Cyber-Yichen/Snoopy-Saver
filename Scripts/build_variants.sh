@@ -23,12 +23,14 @@ fi
 
 SNOOPY_ASSET_ROOT="$LOWRES_ROOT" \
 SNOOPY_BUILD_DIR="$ROOT/.build/SnoopyScreenSaver-1080p" \
+SNOOPY_VARIANT="1080p" \
   "$ROOT/Scripts/build_saver.sh"
 ditto "$ROOT/.build/SnoopyScreenSaver-1080p/SnoopyScreenSaver.saver" \
   "$OUTPUT/Snoopy-1080p.saver"
 
 SNOOPY_ASSET_ROOT="$LITE_ROOT" \
 SNOOPY_BUILD_DIR="$ROOT/.build/SnoopyScreenSaver-CDN-Lite" \
+SNOOPY_VARIANT="cdn-lite" \
   "$ROOT/Scripts/build_saver.sh"
 ditto "$ROOT/.build/SnoopyScreenSaver-CDN-Lite/SnoopyScreenSaver.saver" \
   "$OUTPUT/Snoopy-CDN-Lite.saver"

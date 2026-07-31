@@ -279,6 +279,9 @@ final class SpriteAssetPlayer {
                 cursor = CMTimeAdd(cursor, sourceDuration); insertedAny = true
             } catch {
                 NSLog("Snoopy sprite composition error: %@", String(describing: error))
+                SnoopyDiagnostics.shared.log(
+                    "player", "sprite composition failed file=\(url.lastPathComponent): \(error)"
+                )
             }
         }
         guard insertedAny else { isPlaying = false; completion?(); return }
@@ -378,6 +381,11 @@ final class SpriteAssetPlayer {
 
     private func observeReady(_ item: AVPlayerItem, player: AVPlayer, layer: CALayer) {
         observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self, weak player, weak layer] item, _ in
+            if item.status == .failed {
+                SnoopyDiagnostics.shared.log(
+                    "player", "item failed: \(item.error?.localizedDescription ?? "unknown error")"
+                )
+            }
             guard item.status == .readyToPlay, let self, let player, let layer, self.isPlaying else { return }
             DispatchQueue.main.async {
                 player.preroll(atRate: 1) { [weak self, weak player, weak layer] _ in
