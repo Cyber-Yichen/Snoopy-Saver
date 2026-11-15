@@ -36,7 +36,7 @@ final class FrameDecoder {
     init(decode: @escaping (URL, Int) -> CGImage? = FrameDecoder.decodeImage) {
         self.decode = decode
         cache.countLimit = 64
-        cache.totalCostLimit = 256 * 1024 * 1024
+        cache.totalCostLimit = 128 * 1024 * 1024
         queue = OperationQueue()
         queue.name = "local.snoopy.frame-decoder"
         queue.qualityOfService = .utility
@@ -142,13 +142,7 @@ final class FrameDecoder {
             kCGImageSourceThumbnailMaxPixelSize: max(64, maxPixelSize),
             kCGImageSourceShouldCacheImmediately: true,
         ]
-        guard let sourceImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
-            return nil
-        }
-
-        // `ShouldCacheImmediately` makes this a decoded thumbnail rather than
-        // the lazy ImageIO-backed image used by the old implementation.
-        return sourceImage
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
 }
 
@@ -169,6 +163,9 @@ final class SpriteAssetPlayer {
     private var frameReady = false
     private var desiredFrameKey: String?
     private var pendingFrameKey: String?
+    private var displayedFrameKey: String?
+    private var loopImages: [Int: CGImage] = [:]
+    private var loopPixelSize: Int?
     private var decoderClientID = UUID()
     private var frameURLs: [String: URL] = [:]
     private(set) var isPlaying = false
@@ -267,6 +264,9 @@ final class SpriteAssetPlayer {
         frameReady = false
         desiredFrameKey = nil
         pendingFrameKey = nil
+        displayedFrameKey = nil
+        loopImages.removeAll()
+        loopPixelSize = nil
         frameURLs.removeAll(keepingCapacity: false)
         onReady = nil
         workItems.forEach { $0.cancel() }; workItems.removeAll()
@@ -277,7 +277,12 @@ final class SpriteAssetPlayer {
             $0.cancelPendingPrerolls(); $0.pause(); $0.replaceCurrentItem(with: nil)
         }
         players.removeAll()
-        layers.forEach { $0.removeAllAnimations(); $0.removeFromSuperlayer() }; layers.removeAll()
+        layers.forEach {
+            $0.contents = nil
+            $0.removeAllAnimations()
+            $0.removeFromSuperlayer()
+        }
+        layers.removeAll()
         layerDescriptors.removeAll()
         frameLayer = nil; frameDescriptor = nil
     }
@@ -307,8 +312,10 @@ final class SpriteAssetPlayer {
         ) else { isPlaying = false; completion?(); return }
         var cursor = CMTime.zero
         var insertedAny = false
+        var sources: [URL: AVURLAsset] = [:]
         for (_, url) in entries {
-            let sourceAsset = AVURLAsset(url: url)
+            let sourceAsset = sources[url] ?? AVURLAsset(url: url)
+            sources[url] = sourceAsset
             guard let sourceTrack = sourceAsset.tracks(withMediaType: .video).first else { continue }
             let sourceDuration = sourceAsset.duration
             guard sourceDuration.isValid, sourceDuration.seconds.isFinite, sourceDuration.seconds > 0 else { continue }
@@ -457,6 +464,9 @@ final class SpriteAssetPlayer {
         frameReady = false
         desiredFrameKey = nil
         pendingFrameKey = nil
+        displayedFrameKey = nil
+        loopImages.removeAll()
+        loopPixelSize = nil
         layerDescriptors[ObjectIdentifier(layer)] = descriptor
         layer.frame = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
         requestFrame(
@@ -483,10 +493,16 @@ final class SpriteAssetPlayer {
     ) {
         guard let url = frameURL(frameNumber, descriptor: descriptor) else { return }
         let pixelSize = targetPixelSize(for: descriptor)
+        if descriptor.loops, loopPixelSize != pixelSize {
+            loopImages.removeAll()
+            loopPixelSize = pixelSize
+        }
         let key = FrameDecoder.shared.key(for: url, maxPixelSize: pixelSize)
         desiredFrameKey = key
+        guard key != displayedFrameKey else { return }
 
-        if let image = FrameDecoder.shared.cachedImage(for: url, maxPixelSize: pixelSize) {
+        if let image = loopImages[frameNumber] ?? FrameDecoder.shared.cachedImage(for: url, maxPixelSize: pixelSize) {
+            if descriptor.loops { loopImages[frameNumber] = image }
             installFrame(
                 image,
                 key: key,
@@ -505,7 +521,9 @@ final class SpriteAssetPlayer {
         ) { [weak self, weak layer] image in
             guard let self, let layer else { return }
             if self.pendingFrameKey == key { self.pendingFrameKey = nil }
-            guard let image, self.desiredFrameKey == key else { return }
+            guard let image, self.isPlaying, self.frameGeneration == generation else { return }
+            if descriptor.loops, self.loopPixelSize == pixelSize { self.loopImages[frameNumber] = image }
+            guard self.desiredFrameKey == key else { return }
             self.installFrame(
                 image,
                 key: key,
@@ -528,6 +546,7 @@ final class SpriteAssetPlayer {
         CATransaction.setDisableActions(true)
         layer.contents = image
         CATransaction.commit()
+        displayedFrameKey = key
         completion?()
     }
 
@@ -540,7 +559,8 @@ final class SpriteAssetPlayer {
             } else {
                 local = min(descriptor.frameCount - 1, localFrame + offset)
             }
-            guard let url = frameURL(descriptor.startFrame + local, descriptor: descriptor) else { continue }
+            let frame = descriptor.startFrame + local
+            guard loopImages[frame] == nil, let url = frameURL(frame, descriptor: descriptor) else { continue }
             FrameDecoder.shared.request(url, maxPixelSize: pixelSize, clientID: decoderClientID)
             if !descriptor.loops && local == descriptor.frameCount - 1 { break }
         }
@@ -554,7 +574,15 @@ final class SpriteAssetPlayer {
         let longestSide = min(1920, max(frame.width, frame.height))
         // Quantization prevents a resize from generating many nearly identical
         // cache variants while still decoding at the current display size.
-        return max(256, Int(ceil(longestSide / 128)) * 128)
+        let displaySize = max(256, Int(ceil(longestSide / 128)) * 128)
+        guard descriptor.loops else { return displaySize }
+        // Reserve a whole loop at a bounded size. At 1440 pixels a base-pose
+        // loop alone can overflow the shared cache and re-decode every frame
+        // on every repetition, churning CoreGraphics and compositor rasters.
+        let aspect = max(descriptor.assetSize.width, descriptor.assetSize.height)
+            / max(1, min(descriptor.assetSize.width, descriptor.assetSize.height))
+        let capacity = sqrt(64 * 1024 * 1024 * aspect / (4 * CGFloat(descriptor.frameCount)))
+        return min(displaySize, max(1, Int(capacity.rounded(.down))))
     }
 
     private func frameURL(_ number: Int, descriptor: SpriteDescriptor) -> URL? {

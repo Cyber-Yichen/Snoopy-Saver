@@ -27,8 +27,8 @@ final class TransitionFrames {
 
     private static let cache: NSCache<NSString, CachedPair> = {
         let cache = NSCache<NSString, CachedPair>()
-        cache.countLimit = 2
-        cache.totalCostLimit = 96 * 1024 * 1024
+        cache.countLimit = 1
+        cache.totalCostLimit = 48 * 1024 * 1024
         return cache
     }()
 
