@@ -13,11 +13,13 @@ private enum RuntimeFailure: Error, CustomStringConvertible {
 @main
 struct RuntimeSmoke {
     static func main() throws {
-        guard CommandLine.arguments.count == 2 else {
-            throw RuntimeFailure.failed("usage: RuntimeSmoke SAVER_PATH")
+        let arguments = CommandLine.arguments
+        let manualPreview = arguments.count == 3 && arguments[2] == "--preview"
+        guard arguments.count == 2 || manualPreview else {
+            throw RuntimeFailure.failed("usage: RuntimeSmoke SAVER_PATH [--preview]")
         }
-        _ = NSApplication.shared
-        let url = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        let app = NSApplication.shared
+        let url = URL(fileURLWithPath: arguments[1], isDirectory: true)
         guard let bundle = Bundle(url: url), bundle.load(),
               let saverType = bundle.principalClass as? ScreenSaverView.Type,
               let view = saverType.init(
@@ -27,10 +29,23 @@ struct RuntimeSmoke {
         }
 
         let window = NSWindow(
-            contentRect: view.frame, styleMask: [.borderless],
+            contentRect: view.frame, styleMask: manualPreview ? [.titled, .closable, .miniaturizable, .resizable] : [.borderless],
             backing: .buffered, defer: false
         )
         window.contentView = view
+        if manualPreview {
+            app.setActivationPolicy(.regular)
+            let delegate = PreviewWindowDelegate(view: view)
+            window.delegate = delegate
+            window.isReleasedWhenClosed = false
+            window.title = "Snoopy Beta Preview"
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            app.activate(ignoringOtherApps: true)
+            view.startAnimation()
+            withExtendedLifetime(delegate) { app.run() }
+            return
+        }
         window.orderFront(nil)
         defer {
             view.stopAnimation()
@@ -155,5 +170,18 @@ struct RuntimeSmoke {
             }
         }
         return status == KERN_SUCCESS ? UInt64(info.resident_size) : 0
+    }
+}
+
+private final class PreviewWindowDelegate: NSObject, NSWindowDelegate {
+    private weak var view: ScreenSaverView?
+
+    init(view: ScreenSaverView) {
+        self.view = view
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        view?.stopAnimation()
+        NSApplication.shared.terminate(nil)
     }
 }

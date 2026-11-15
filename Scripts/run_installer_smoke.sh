@@ -6,7 +6,7 @@ BUNDLE="$1"
 FIXTURE="$(mktemp -d "$ROOT/.build/InstallerSmoke.XXXXXXXX")"
 trap 'rm -rf "$FIXTURE"' EXIT
 SAVER_DIR="$FIXTURE/user/Library/Screen Savers"
-INSTALLED="$SAVER_DIR/Snoopy.saver"
+INSTALLED="$SAVER_DIR/Snoopy-4K.saver"
 UPDATE="$FIXTURE/Update.saver"
 mkdir -p "$SAVER_DIR" "$FIXTURE/bin" "$FIXTURE/Invalid.saver"
 
@@ -42,9 +42,14 @@ if SNOOPY_TEST_FAIL_RENAME=1 bash "$FIXTURE/install.sh" "$UPDATE"; then
 fi
 codesign --verify --deep --strict "$INSTALLED"
 test ! -e "$INSTALLED/Contents/Resources/installer-smoke-marker"
-test ! -e "$SAVER_DIR/.Snoopy.saver.previous"
+test ! -e "$SAVER_DIR/.snoopy-install-backup/Snoopy-4K.saver"
 
 bash "$FIXTURE/install.sh" "$UPDATE"
 codesign --verify --deep --strict "$INSTALLED"
 test -e "$INSTALLED/Contents/Resources/installer-smoke-marker"
-echo "Installer smoke passed: invalid input preserved old bundle, failed rename restored it, valid update installed."
+test ! -e "$SAVER_DIR/Snoopy.saver"
+
+rm -rf "$INSTALLED"
+bash "$FIXTURE/install.sh" "$UPDATE"
+codesign --verify --deep --strict "$SAVER_DIR/Snoopy.saver"
+echo "Installer smoke passed: invalid input and failed rename preserved the old bundle, updated its existing filename, and installed to the default on a clean system."

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SAVER="${1:-$ROOT/.build/SnoopyScreenSaver/SnoopyScreenSaver.saver}"
+if [[ "$#" -gt 0 ]]; then shift; fi
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 BUILD="$ROOT/.build/RuntimeSmoke"
 MODULE_CACHE="$ROOT/.build/ModuleCache"
@@ -19,6 +20,6 @@ xcrun swiftc -swift-version 5 -target "$(uname -m)-apple-macosx12.0" -sdk "$SDK"
   -framework AppKit -framework ScreenSaver \
   -o "$BUILD/runtime-smoke"
 
-ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1}" \
+exec env ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:halt_on_error=1}" \
   SNOOPY_DISABLE_ENVIRONMENT_IO=1 \
-  "$BUILD/runtime-smoke" "$SAVER"
+  "$BUILD/runtime-smoke" "$SAVER" "$@"

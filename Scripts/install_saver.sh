@@ -3,7 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL_DIR="$HOME/Library/Screen Savers"
 DEST="$INSTALL_DIR/Snoopy.saver"
-BACKUP="$INSTALL_DIR/.Snoopy.saver.previous"
+BACKUP_DIR="$INSTALL_DIR/.snoopy-install-backup"
+IDENTIFIER="local.snoopy.ScreenSaver"
 
 if [[ "${1:-}" != "--locked" ]]; then
   SOURCE="${1:-$ROOT/.build/SnoopyScreenSaver/SnoopyScreenSaver.saver}"
@@ -13,12 +14,39 @@ if [[ "${1:-}" != "--locked" ]]; then
 fi
 SOURCE="$2"
 
-if [[ -e "$BACKUP" && ! -e "$DEST" ]]; then
-  mv "$BACKUP" "$DEST"
-elif [[ -e "$BACKUP" ]]; then
-  codesign --verify --deep --strict "$DEST"
-  rm -rf "$BACKUP"
+bundle_identifier() {
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$1/Contents/Info.plist"
+}
+
+for previous in "$BACKUP_DIR"/*.saver; do
+  [[ -e "$previous" ]] || continue
+  previous_destination="$INSTALL_DIR/${previous##*/}"
+  if [[ -e "$previous_destination" ]]; then
+    codesign --verify --deep --strict "$previous_destination"
+    rm -rf "$previous"
+  else
+    mv "$previous" "$previous_destination"
+  fi
+done
+
+installed=()
+for candidate in "$INSTALL_DIR"/*.saver; do
+  [[ -d "$candidate" ]] || continue
+  if [[ "$(bundle_identifier "$candidate" 2>/dev/null || true)" == "$IDENTIFIER" ]]; then
+    installed+=("$candidate")
+  fi
+done
+if [[ "${#installed[@]}" -gt 1 ]]; then
+  echo "Multiple installed Snoopy bundles share the standard identifier." >&2
+  printf '  %s\n' "${installed[@]}" >&2
+  exit 2
+elif [[ "${#installed[@]}" -eq 1 ]]; then
+  DEST="${installed[0]}"
+elif [[ -e "$DEST" ]]; then
+  echo "The destination already exists with an unrecognized bundle identifier: $DEST" >&2
+  exit 2
 fi
+BACKUP="$BACKUP_DIR/${DEST##*/}"
 
 STAGING="$(mktemp -d "$INSTALL_DIR/.snoopy-install.XXXXXXXX")"
 cleanup() {
@@ -36,7 +64,7 @@ trap 'exit 1' HUP INT TERM
 STAGED_SAVER="$STAGING/Snoopy.saver"
 ditto "$SOURCE" "$STAGED_SAVER"
 codesign --verify --deep --strict "$STAGED_SAVER"
-if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$STAGED_SAVER/Contents/Info.plist")" != "local.snoopy.ScreenSaver" ]]; then
+if [[ "$(bundle_identifier "$STAGED_SAVER")" != "$IDENTIFIER" ]]; then
   echo "Unsupported Snoopy bundle identifier." >&2
   exit 2
 fi
@@ -46,7 +74,10 @@ fi
 pkill -x legacyScreenSaver 2>/dev/null || true
 pkill -x ScreenSaverEngine 2>/dev/null || true
 pkill -f 'com.apple.ScreenSaver.Engine' 2>/dev/null || true
-if [[ -e "$DEST" ]]; then mv "$DEST" "$BACKUP"; fi
+if [[ -e "$DEST" ]]; then
+  mkdir -p "$BACKUP_DIR"
+  mv "$DEST" "$BACKUP"
+fi
 mv "$STAGED_SAVER" "$DEST"
 rm -rf "$BACKUP"
 pkill -x legacyScreenSaver 2>/dev/null || true
