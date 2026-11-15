@@ -213,29 +213,51 @@ final class AssetCatalog {
         for activeScene: AssetRecord,
         environment: EnvironmentSnapshot,
         scorer: RelevancyEngine,
-        avoiding pairID: String?
-    ) -> TransitionChoice {
-        var options: [(AssetRecord, Bool, Double)] = []
+        avoiding pairID: String?,
+        avoidingRevealPose poseID: String?,
+        allowIdlePreservation: Bool
+    ) -> TransitionChoice? {
+        var options: [(pair: AssetRecord, choice: TransitionChoice, score: Double)] = []
         for categoryID in activeScene.transitionCategoryIDs {
-            guard let category = byID["sceneTransitionCategory/\(categoryID)"] else { continue }
+            guard let category = byID["sceneTransitionCategory/\(categoryID)"],
+                  allowIdlePreservation || !category.preventsIdleSceneChange else { continue }
+            let hidePose = transitionPoses(category.hideCharacterPoseIDs, phase: "hide").randomElement()
+            let revealPoses = transitionPoses(category.revealCharacterPoseIDs, phase: "reveal")
+            let revealPose = revealPoses.filter { $0.identifier != poseID }.randomElement()
+                ?? revealPoses.randomElement()
             for transitionID in category.transitionPairIDs {
-                guard transitionID != pairID,
-                      let pair = byID["sceneTransitionPair/\(transitionID)"],
+                guard let pair = byID["sceneTransitionPair/\(transitionID)"],
+                      let hide = transitionSequence(pair.hideTransitionID),
+                      let reveal = transitionSequence(pair.revealTransitionID),
                       let score = scorer.score(pair, kind: "sceneTransitionPair", environment: environment)
                 else { continue }
-                options.append((pair, category.preventsIdleSceneChange, score))
+                let choice = TransitionChoice(
+                    pairID: pair.identifier, style: Self.transitionStyle(pair.identifier),
+                    preventsIdleSceneChange: category.preventsIdleSceneChange,
+                    hide: hide, reveal: reveal, hidePose: hidePose, revealPose: revealPose
+                )
+                options.append((pair, choice, score))
             }
         }
-        if let maximum = options.map(\.2).max(),
-           let selected = options.filter({ abs($0.2 - maximum) < 0.000_001 }).randomElement() {
-            scorer.mark(selected.0, kind: "sceneTransitionPair", at: environment.date)
-            return TransitionChoice(
-                pairID: selected.0.identifier,
-                style: Self.transitionStyle(selected.0.identifier),
-                preventsIdleSceneChange: selected.1
-            )
-        }
-        return TransitionChoice(pairID: "fallback-dissolve", style: .dissolve, preventsIdleSceneChange: false)
+        let freshPoses = options.filter { $0.choice.revealPose?.identifier != poseID }
+        if poseID != nil, !freshPoses.isEmpty { options = freshPoses }
+        let freshPairs = options.filter { $0.pair.identifier != pairID }
+        if !freshPairs.isEmpty { options = freshPairs }
+        guard let maximum = options.map(\.score).max(),
+              let selected = options.filter({ abs($0.score - maximum) < 0.000_001 }).randomElement()
+        else { return nil }
+        scorer.mark(selected.pair, kind: "sceneTransitionPair", at: environment.date)
+        return selected.choice
+    }
+
+    private func transitionSequence(_ id: String?) -> TransitionSequence? {
+        guard let id, let record = byID["spriteTransitionParameters/\(id)"] else { return nil }
+        return TransitionSequence(record.sprites)
+    }
+
+    private func transitionPoses(_ ids: [String], phase: String) -> [AssetRecord] {
+        ids.compactMap { byID["characterSceneTransitionPose/\($0)"] }
+            .filter { $0.transitionPhase == phase && $0.activeMovieURL != nil }
     }
 
     private static func transitionStyle(_ id: String) -> OfficialTransitionStyle {
@@ -259,6 +281,8 @@ final class AssetCatalog {
             ("characterPoseTransition", .characterPoseTransition),
             ("sceneTransitionCategory", .sceneTransitionCategory),
             ("sceneTransitionPair", .sceneTransitionPair), ("scenePalette", .scenePalette),
+            ("spriteTransitionParameters", .spriteTransitionParameters),
+            ("characterSceneTransitionPose", .characterSceneTransitionPose),
             ("switcherScene", .switcherScene),
         ]
         guard let match = supported.first(where: { root[$0.0] != nil }),
@@ -269,6 +293,10 @@ final class AssetCatalog {
         let priority = path.contains("/Optional/") ? 3 : (path.contains("DefaultAssetBundleV2") ? 2 : 1)
         let exclusions = payload["exclusions"] as? [String: Any] ?? [:]
         let offset = payload["sceneOffset"] as? [String: Any] ?? [:]
+        func parametersID(_ field: String) -> String? {
+            let style = payload[field] as? [String: Any]
+            return (style?["sprite"] as? [String: Any])?["parametersID"] as? String
+        }
         let palette: Palette?
         if let background = color(payload["backgroundColor"]) {
             palette = Palette(background: background, overlay: color(payload["overlayColor"]))
@@ -282,6 +310,11 @@ final class AssetCatalog {
             endPoseID: payload["endCharacterBasePoseID"] as? String,
             transitionCategoryIDs: Set(payload["transitionCategoryIDs"] as? [String] ?? []),
             transitionPairIDs: Set(payload["sceneTransitionPairIDs"] as? [String] ?? []),
+            hideTransitionID: parametersID("hideStyle"),
+            revealTransitionID: parametersID("revealStyle"),
+            hideCharacterPoseIDs: payload["hideCharacterPoseIDs"] as? [String] ?? [],
+            revealCharacterPoseIDs: payload["revealCharacterPoseIDs"] as? [String] ?? [],
+            transitionPhase: payload["transitionPhase"] as? String,
             preventsIdleSceneChange: payload["preventsIdleSceneChange"] as? Bool ?? false,
             sceneOffset: CGPoint(x: number(offset["x"]), y: number(offset["y"])),
             ignoresSceneOffset: payload["ignoresSceneOffset"] as? Bool ?? false,

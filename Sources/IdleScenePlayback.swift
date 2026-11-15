@@ -16,9 +16,10 @@ final class IdleScenePlayback {
     private let halftoneMask = CALayer()
     private var permanent: [SpriteAssetPlayer] = []
     private var character: SpriteAssetPlayer?
+    private var transitionCharacter: SpriteAssetPlayer?
     private var visitors: [SpriteAssetPlayer] = []
     private var tasks: [DispatchWorkItem] = []
-    private var currentPoseID: String
+    private(set) var currentPoseID: String
     private var animationCounts: [AssetKind: Int] = [.characterBasePose: 1]
     private var prepared = false
     private var activated = false
@@ -33,11 +34,12 @@ final class IdleScenePlayback {
         scorer: RelevancyEngine,
         environment: EnvironmentProvider,
         frame: CGRect,
-        targetDuration: TimeInterval
+        targetDuration: TimeInterval,
+        initialPoseID: String? = nil
     ) {
         self.composition = composition; self.catalog = catalog; self.scorer = scorer
         self.environment = environment; self.targetDuration = targetDuration
-        currentPoseID = composition.basePose.identifier
+        currentPoseID = initialPoseID ?? composition.basePose.identifier
         container.frame = frame; container.masksToBounds = true
         background.frame = container.bounds
         background.backgroundColor = composition.palette?.palette?.background.cgColor
@@ -82,11 +84,32 @@ final class IdleScenePlayback {
     func tick(_ date: Date = Date()) {
         permanent.forEach { $0.tick(date) }; character?.tick(date); visitors.forEach { $0.tick(date) }
     }
+
+    func playTransitionPose(_ pose: AssetRecord?) {
+        guard let pose else { return }
+        let action = player(offset: composition.scene.sceneOffset)
+        transitionCharacter?.stop()
+        transitionCharacter = action
+        action.onReady = { [weak self, weak action] in
+            guard let self, let action, self.transitionCharacter === action else { return }
+            self.character?.setHidden(true)
+        }
+        action.play(pose)
+    }
+
+    func clearTransitionPose() {
+        transitionCharacter?.stop()
+        transitionCharacter = nil
+        character?.setHidden(false)
+    }
+
     func resize(_ frame: CGRect) {
         container.frame = frame; background.frame = container.bounds; halftone.frame = container.bounds; halftoneMask.frame = container.bounds
         permanent.forEach { $0.resize() }; character?.resize(); visitors.forEach { $0.resize() }
+        transitionCharacter?.resize()
     }
     func stop() {
+        clearTransitionPose()
         stopped = true; tasks.forEach { $0.cancel() }; tasks.removeAll()
         permanent.forEach { $0.stop() }; character?.stop(); visitors.forEach { $0.stop() }
         permanent.removeAll(); visitors.removeAll(); character = nil
@@ -107,6 +130,10 @@ final class IdleScenePlayback {
     private func scheduleCharacter(after delay: TimeInterval) {
         schedule(delay) { [weak self] in
             guard let self, !self.stopped else { return }
+            if self.transitionCharacter != nil {
+                self.scheduleCharacter(after: 1)
+                return
+            }
             let snapshot = self.environment.snapshot()
             let dependency = self.dependencyEnvironment()
             let kind = self.nextAnimationKind()

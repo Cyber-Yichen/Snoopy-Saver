@@ -1,38 +1,186 @@
 import AppKit
 import QuartzCore
 
-enum TransitionAnimator {
-    static func duration(for style: OfficialTransitionStyle) -> CFTimeInterval {
-        switch style {
-        case .dissolve: return 1.5
-        case .horizontalWipe: return 1.9
-        case .clockWipe: return 2.15
-        case .circularWipe: return 2.0
-        case .thoughtBubble: return 2.25
-        case .sleepingDreamBubble: return 2.4
+/// Decoded as a unit so the mask and its ink outline never advance independently.
+final class TransitionFrames {
+    struct Phase {
+        let mask: [CGImage]
+        let outline: [CGImage]
+        var duration: TimeInterval { Double(mask.count) / TransitionSequence.framesPerSecond }
+    }
+
+    struct Pair {
+        let hide: Phase
+        let reveal: Phase
+    }
+
+    private static let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "local.snoopy.transition-decoder"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        return queue
+    }()
+
+    private let operation = BlockOperation()
+    private var callbacks: [(Pair?) -> Void] = []
+    private var finished = false
+    private var result: Pair?
+
+    init(choice: TransitionChoice, pixelWidth: CGFloat) {
+        let hide = choice.hide
+        let reveal = choice.reveal
+        // Reserve at most about 48 MiB of RGBA image pixels for a pair.
+        let frameCount = Double(2 * (hide.mask.frameCount + reveal.mask.frameCount))
+        let aspect = Double(hide.mask.assetSize.width / hide.mask.assetSize.height)
+        let boundedWidth = sqrt(48 * 1024 * 1024 * aspect / (4 * frameCount))
+        let pixelSize = Int(min(max(320, pixelWidth), min(768, boundedWidth)))
+        operation.addExecutionBlock { [weak self, weak operation] in
+            guard let operation else { return }
+            let result: Pair? = autoreleasepool {
+                guard let hide = Self.decode(hide, pixelSize: pixelSize, operation: operation),
+                      let reveal = Self.decode(reveal, pixelSize: pixelSize, operation: operation)
+                else { return nil }
+                return Pair(hide: hide, reveal: reveal)
+            }
+            guard !operation.isCancelled else { return }
+            DispatchQueue.main.async { [weak self] in self?.complete(result) }
+        }
+        Self.queue.addOperation(operation)
+    }
+
+    deinit { operation.cancel() }
+
+    func whenReady(_ callback: @escaping (Pair?) -> Void) {
+        if finished { callback(result) }
+        else { callbacks.append(callback) }
+    }
+
+    private func complete(_ pair: Pair?) {
+        result = pair
+        finished = true
+        let pending = callbacks
+        callbacks.removeAll()
+        pending.forEach { $0(pair) }
+    }
+
+    private static func decode(
+        _ sequence: TransitionSequence, pixelSize: Int, operation: Operation
+    ) -> Phase? {
+        var masks: [CGImage] = []
+        var outlines: [CGImage] = []
+        for frame in sequence.mask.startFrame...sequence.mask.endFrame {
+            guard !operation.isCancelled,
+                  let maskURL = sequence.mask.frameURL(frame),
+                  let outlineURL = sequence.outline.frameURL(frame),
+                  let mask = autoreleasepool(invoking: { FrameDecoder.decodeImage(maskURL, maxPixelSize: pixelSize) }),
+                  let outline = autoreleasepool(invoking: { FrameDecoder.decodeImage(outlineURL, maxPixelSize: pixelSize) })
+            else { return nil }
+            masks.append(mask)
+            outlines.append(outline)
+        }
+        return Phase(mask: masks, outline: outlines)
+    }
+}
+
+final class TransitionAnimator {
+    static let dissolveDuration: TimeInterval = 1.5
+
+    private let root: CALayer
+    private let incoming: CALayer
+    private let outgoing: CALayer?
+    private let backdrop: CGColor
+    private let mask = CALayer()
+    private let outline = CALayer()
+    private var previousBackground: CGColor?
+    private var maskedLayer: CALayer?
+    private var work: DispatchWorkItem?
+    private var frameTimer: Timer?
+    private var active = true
+    private var started = false
+
+    init(root: CALayer, incoming: CALayer, outgoing: CALayer?, backdrop: CGColor) {
+        self.root = root
+        self.incoming = incoming
+        self.outgoing = outgoing
+        self.backdrop = backdrop
+        mask.contentsGravity = .resizeAspectFill
+        outline.contentsGravity = .resizeAspectFill
+        outline.zPosition = 100
+    }
+
+    func play(
+        frames: TransitionFrames?,
+        onSpriteStart: @escaping () -> Void,
+        onCut: @escaping () -> Void,
+        completion: @escaping () -> Void
+    ) {
+        // Mirror the old dissolve for first presentation and incomplete assets.
+        guard let frames, let outgoing else {
+            dissolve(onCut: onCut, completion: completion)
+            return
+        }
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.active, !self.started else { return }
+            NSLog("Snoopy transition frames not ready; using dissolve")
+            self.dissolve(onCut: onCut, completion: completion)
+        }
+        work = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timeout)
+        frames.whenReady { [weak self] pair in
+            guard let self, self.active, !self.started else { return }
+            self.work?.cancel()
+            guard let pair else {
+                NSLog("Snoopy transition frames missing or unreadable; using dissolve")
+                self.dissolve(onCut: onCut, completion: completion)
+                return
+            }
+            self.started = true
+            self.previousBackground = self.root.backgroundColor
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            self.root.backgroundColor = self.backdrop
+            self.root.addSublayer(self.outline)
+            self.installMask(over: outgoing, phaseName: "hide")
+            CATransaction.commit()
+            onSpriteStart()
+            self.playPhase(pair.hide) { [weak self] in
+                guard let self else { return }
+                CATransaction.begin(); CATransaction.setDisableActions(true)
+                outgoing.opacity = 0
+                self.installMask(over: self.incoming, phaseName: "reveal")
+                self.incoming.opacity = 1
+                CATransaction.commit()
+                onCut()
+                self.playPhase(pair.reveal) { [weak self] in
+                    self?.complete(completion)
+                }
+            }
         }
     }
 
-    static func reveal(
-        incoming: CALayer,
-        over outgoing: CALayer?,
-        style: OfficialTransitionStyle,
-        in bounds: CGRect,
-        completion: @escaping () -> Void
-    ) {
-        guard let outgoing else {
-            incoming.opacity = 0
-            fade(incoming: incoming, outgoing: nil, completion: completion)
-            return
+    func resize() {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        outline.frame = root.bounds
+        if let maskedLayer { mask.frame = maskedLayer.bounds }
+        CATransaction.commit()
+    }
+
+    func cancel() {
+        guard active else { return }
+        active = false
+        work?.cancel(); work = nil
+        frameTimer?.invalidate(); frameTimer = nil
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        if outline.superlayer != nil {
+            root.backgroundColor = previousBackground
+            outline.removeFromSuperlayer()
         }
-        switch style {
-        case .dissolve: fade(incoming: incoming, outgoing: outgoing, completion: completion)
-        case .horizontalWipe: maskReveal(incoming, paths: horizontalPaths(bounds), duration: duration(for: style), completion: completion)
-        case .clockWipe: maskReveal(incoming, paths: clockPaths(bounds), duration: duration(for: style), completion: completion)
-        case .circularWipe: maskReveal(incoming, paths: circularPaths(bounds), duration: duration(for: style), completion: completion)
-        case .thoughtBubble: maskReveal(incoming, paths: bubblePaths(bounds, sleeping: false), duration: duration(for: style), completion: completion)
-        case .sleepingDreamBubble: maskReveal(incoming, paths: bubblePaths(bounds, sleeping: true), duration: duration(for: style), completion: completion)
-        }
+        maskedLayer?.mask = nil; maskedLayer = nil
+        mask.removeAllAnimations(); mask.contents = nil
+        outline.removeAllAnimations(); outline.contents = nil
+        incoming.removeAnimation(forKey: "snoopyFadeIn")
+        outgoing?.removeAnimation(forKey: "snoopyFadeOut")
+        CATransaction.commit()
     }
 
     static func finishReveal(_ layer: CALayer) {
@@ -43,95 +191,75 @@ enum TransitionAnimator {
         CATransaction.commit()
     }
 
-    private static func fade(incoming: CALayer, outgoing: CALayer?, completion: @escaping () -> Void) {
-        let interval = duration(for: .dissolve)
+    private func installMask(over layer: CALayer, phaseName: String) {
+        maskedLayer?.mask = nil
+        maskedLayer = layer
+        resize()
+        layer.mask = mask
+        outline.name = "snoopyTransitionOutline.\(phaseName)"
+    }
+
+    private func playPhase(_ phase: TransitionFrames.Phase, completion: @escaping () -> Void) {
+        let start = CACurrentMediaTime()
+        var displayedFrame = 0
+        showFrame(0, of: phase)
+        // Only submit the current pair to Core Animation. Uploading two
+        // sequences as contents keyframes keeps their render surfaces alive.
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            guard let self, self.active else { timer.invalidate(); return }
+            let elapsed = CACurrentMediaTime() - start
+            if elapsed >= phase.duration {
+                timer.invalidate()
+                self.frameTimer = nil
+                completion()
+                return
+            }
+            let frame = min(phase.mask.count - 1, Int(elapsed * TransitionSequence.framesPerSecond))
+            guard frame != displayedFrame else { return }
+            displayedFrame = frame
+            self.showFrame(frame, of: phase)
+        }
+        frameTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func showFrame(_ frame: Int, of phase: TransitionFrames.Phase) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        mask.contents = phase.mask[frame]
+        outline.contents = phase.outline[frame]
+        CATransaction.commit()
+    }
+
+    private func dissolve(onCut: () -> Void, completion: @escaping () -> Void) {
+        guard active, !started else { return }
+        started = true
+        onCut()
         let fadeIn = CABasicAnimation(keyPath: "opacity")
-        fadeIn.fromValue = 0; fadeIn.toValue = 1; fadeIn.duration = interval
+        fadeIn.fromValue = 0; fadeIn.toValue = 1; fadeIn.duration = Self.dissolveDuration
         fadeIn.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         let fadeOut = CABasicAnimation(keyPath: "opacity")
         fadeOut.fromValue = outgoing?.presentation()?.opacity ?? outgoing?.opacity ?? 1
-        fadeOut.toValue = 0; fadeOut.duration = interval
+        fadeOut.toValue = 0; fadeOut.duration = Self.dissolveDuration
         fadeOut.timingFunction = fadeIn.timingFunction
         CATransaction.begin(); CATransaction.setDisableActions(true)
         incoming.opacity = 1; outgoing?.opacity = 0
-        incoming.add(fadeIn, forKey: "snoopyFadeIn"); outgoing?.add(fadeOut, forKey: "snoopyFadeOut")
+        incoming.add(fadeIn, forKey: "snoopyFadeIn")
+        outgoing?.add(fadeOut, forKey: "snoopyFadeOut")
         CATransaction.commit()
-        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: completion)
+        schedule(after: Self.dissolveDuration) { [weak self] in self?.complete(completion) }
     }
 
-    private static func maskReveal(_ incoming: CALayer, paths: [CGPath], duration: CFTimeInterval, completion: @escaping () -> Void) {
-        guard let first = paths.first, let last = paths.last else { completion(); return }
-        incoming.opacity = 0
-        let mask = CAShapeLayer(); mask.frame = incoming.bounds; mask.fillColor = NSColor.white.cgColor; mask.path = first
-        incoming.mask = mask
-        let animation = CAKeyframeAnimation(keyPath: "path")
-        animation.values = paths; animation.keyTimes = (0..<paths.count).map { NSNumber(value: Double($0) / Double(max(1, paths.count - 1))) }
-        animation.duration = duration; animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        animation.fillMode = .both; animation.isRemovedOnCompletion = false
-        // Install the first masked presentation before exposing the incoming
-        // layer. A final model path set too early caused one full-frame flash.
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        mask.path = last
-        mask.add(animation, forKey: "officialReveal")
-        incoming.opacity = 1
-        CATransaction.commit()
-        DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
-            guard incoming.mask === mask else { return }
-            incoming.mask = nil; completion()
-        }
+    private func complete(_ completion: () -> Void) {
+        cancel()
+        completion()
     }
 
-    private static func horizontalPaths(_ bounds: CGRect) -> [CGPath] {
-        (0...12).map { step in
-            let progress = CGFloat(step) / 12
-            return CGPath(rect: CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width * progress, height: bounds.height), transform: nil)
+    private func schedule(after delay: TimeInterval, _ action: @escaping () -> Void) {
+        let item = DispatchWorkItem { [weak self] in
+            guard self?.active == true else { return }
+            action()
         }
-    }
-
-    private static func circularPaths(_ bounds: CGRect) -> [CGPath] {
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let radius = hypot(bounds.width, bounds.height) * 0.6
-        return (0...14).map { step in
-            let r = max(0.5, radius * CGFloat(step) / 14)
-            return CGPath(ellipseIn: CGRect(x: center.x-r, y: center.y-r, width:2*r, height:2*r), transform:nil)
-        }
-    }
-
-    private static func clockPaths(_ bounds: CGRect) -> [CGPath] {
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let radius = hypot(bounds.width, bounds.height)
-        return (0...24).map { step in
-            let end = -.pi / 2 + 2 * .pi * CGFloat(step) / 24
-            let path = CGMutablePath(); path.move(to: center)
-            path.addLine(to: CGPoint(x:center.x, y:center.y-radius))
-            path.addArc(center:center, radius:radius, startAngle:-.pi/2, endAngle:end, clockwise:false)
-            path.closeSubpath(); return path
-        }
-    }
-
-    private static func bubblePaths(_ bounds: CGRect, sleeping: Bool) -> [CGPath] {
-        let origin = sleeping
-            ? CGPoint(x: bounds.maxX * 0.72, y: bounds.minY + bounds.height * 0.25)
-            : CGPoint(x: bounds.minX + bounds.width * 0.28, y: bounds.minY + bounds.height * 0.28)
-        let direction: CGFloat = sleeping ? -1 : 1
-        let finalRadius = hypot(bounds.width, bounds.height)
-        return (0...14).map { step in
-            let progress = CGFloat(step) / 14
-            let path = CGMutablePath()
-            for index in 0..<4 {
-                let t = min(1, max(0, progress * 1.8 - CGFloat(index) * 0.12))
-                let r = (18 + CGFloat(index) * 18) * t
-                let center = CGPoint(x: origin.x + direction * CGFloat(index) * bounds.width * 0.08,
-                                     y: origin.y + CGFloat(index) * bounds.height * 0.09)
-                path.addEllipse(in: CGRect(x:center.x-r, y:center.y-r, width:2*r, height:2*r))
-            }
-            if progress > 0.38 {
-                let t = (progress - 0.38) / 0.62
-                let center = CGPoint(x: bounds.midX, y: bounds.midY)
-                let r = max(1, finalRadius * t)
-                path.addEllipse(in: CGRect(x:center.x-r, y:center.y-r, width:2*r, height:2*r))
-            }
-            return path
-        }
+        work = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 }

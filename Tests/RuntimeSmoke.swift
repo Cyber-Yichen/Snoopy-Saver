@@ -54,9 +54,18 @@ struct RuntimeSmoke {
         }
         var peakResidentBytes = residentBytes()
         var presentedVideoSizes: Set<String> = []
+        var maskFrames: [String: Set<ObjectIdentifier>] = [:]
+        var outlineFrames: [String: Set<ObjectIdentifier>] = [:]
         let samplePlayback = {
             peakResidentBytes = max(peakResidentBytes, residentBytes())
-            for scene in rootLayers(of: view) {
+            let layers = rootLayers(of: view)
+            let outlineLayer = layers.first { $0.name?.hasPrefix("snoopyTransitionOutline.") == true }
+            for scene in layers {
+                if let name = outlineLayer?.name,
+                   let outline = outlineLayer?.contents, let mask = scene.mask?.contents {
+                    maskFrames[name, default: []].insert(ObjectIdentifier(mask as AnyObject))
+                    outlineFrames[name, default: []].insert(ObjectIdentifier(outline as AnyObject))
+                }
                 for layer in scene.sublayers ?? [] {
                     guard let video = layer as? AVPlayerLayer, video.videoGravity == .resizeAspectFill,
                           video.isReadyForDisplay,
@@ -74,7 +83,7 @@ struct RuntimeSmoke {
 
         let environment = ProcessInfo.processInfo.environment
         let switchCount = Int(environment["SNOOPY_RUNTIME_SWITCHES"] ?? "") ?? 8
-        let dwell = Double(environment["SNOOPY_RUNTIME_DWELL"] ?? "") ?? 3
+        let dwell = Double(environment["SNOOPY_RUNTIME_DWELL"] ?? "") ?? 5
         for index in 0..<switchCount {
             let selector = index.isMultiple(of: 2)
                 ? NSSelectorFromString("forceNextSceneForTesting")
@@ -112,6 +121,13 @@ struct RuntimeSmoke {
             "interrupted transitions did not settle to one scene: \(remainingDescriptions)"
         )
         try require(!presentedVideoSizes.isEmpty, "no AVPlayerLayer reported a video frame ready for display")
+        for phase in ["hide", "reveal"] {
+            let name = "snoopyTransitionOutline.\(phase)"
+            try require(
+                (maskFrames[name]?.count ?? 0) > 1 && (outlineFrames[name]?.count ?? 0) > 1,
+                "mask and outline did not both advance during \(phase)"
+            )
+        }
 
         view.stopAnimation()
         spin(seconds: 1)
@@ -129,7 +145,7 @@ struct RuntimeSmoke {
         print(
             "Runtime smoke passed: \(switchCount) normal and \(interruptedSwitches) interrupted scene changes, "
                 + "peakRSS=\(peakResidentBytes / 1_048_576)MiB, clean shutdown, "
-                + "video sizes=\(presentedVideoSizes.sorted().joined(separator: ", "))"
+                + "animated mask and outline in both phases, video sizes=\(presentedVideoSizes.sorted().joined(separator: ", "))"
         )
     }
 

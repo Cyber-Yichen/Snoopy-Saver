@@ -17,6 +17,7 @@ enum AssetKind: String, CaseIterable {
     case activeScene, idleScene, idleSceneVisitor, characterBasePose
     case characterAdditionalPose, characterMoment, characterPoseTransition
     case sceneTransitionCategory, sceneTransitionPair, scenePalette, switcherScene
+    case spriteTransitionParameters, characterSceneTransitionPose
 }
 
 enum SpritePhase: String, CaseIterable { case oneShot, intro, loop, outro }
@@ -112,6 +113,11 @@ struct AssetRecord {
     let endPoseID: String?
     let transitionCategoryIDs: Set<String>
     let transitionPairIDs: Set<String>
+    let hideTransitionID: String?
+    let revealTransitionID: String?
+    let hideCharacterPoseIDs: [String]
+    let revealCharacterPoseIDs: [String]
+    let transitionPhase: String?
     let preventsIdleSceneChange: Bool
     let sceneOffset: CGPoint
     let ignoresSceneOffset: Bool
@@ -131,6 +137,33 @@ struct TransitionChoice {
     let pairID: String
     let style: OfficialTransitionStyle
     let preventsIdleSceneChange: Bool
+    let hide: TransitionSequence
+    let reveal: TransitionSequence
+    let hidePose: AssetRecord?
+    let revealPose: AssetRecord?
+}
+
+struct TransitionSequence {
+    // IdleCharacterCore.SpriteTiming uses a 24 fps frame time base on tvOS 27.2.
+    static let framesPerSecond: Double = 24
+
+    let mask: SpriteDescriptor
+    let outline: SpriteDescriptor
+
+    init?(_ sprites: [SpriteDescriptor]) {
+        guard let mask = sprites.first(where: { $0.plane == "mask" }),
+              let outline = sprites.first(where: { $0.plane == "foregroundEffect" }),
+              mask.mediaType == .frameSequence, outline.mediaType == .frameSequence,
+              mask.startFrame >= 0, mask.endFrame >= mask.startFrame,
+              mask.endFrame <= 240,
+              mask.startFrame == outline.startFrame, mask.endFrame == outline.endFrame,
+              mask.assetSize == outline.assetSize, mask.assetSize.width > 0, mask.assetSize.height > 0
+        else { return nil }
+        self.mask = mask
+        self.outline = outline
+    }
+
+    var duration: TimeInterval { Double(mask.frameCount) / Self.framesPerSecond }
 }
 
 struct IdleComposition {

@@ -131,7 +131,7 @@ final class FrameDecoder {
         }
     }
 
-    private static func decodeImage(_ url: URL, maxPixelSize: Int) -> CGImage? {
+    static func decodeImage(_ url: URL, maxPixelSize: Int) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(
             url as CFURL,
             [kCGImageSourceShouldCache: false] as CFDictionary
@@ -218,6 +218,12 @@ final class SpriteAssetPlayer {
             guard let descriptor = layerDescriptors[ObjectIdentifier(layer)] else { continue }
             layer.frame = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
         }
+    }
+
+    func setHidden(_ hidden: Bool) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layers.forEach { $0.isHidden = hidden }
+        CATransaction.commit()
     }
 
     func stop() {
