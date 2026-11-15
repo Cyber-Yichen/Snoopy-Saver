@@ -98,6 +98,10 @@ struct Palette {
 }
 
 struct AssetRecord {
+    var activeMovieURL: URL? {
+        sprites.lazy.filter { $0.mediaType == .video }.compactMap(\.movieURL).first
+    }
+
     let identifier: String
     let kind: AssetKind
     let directoryURL: URL

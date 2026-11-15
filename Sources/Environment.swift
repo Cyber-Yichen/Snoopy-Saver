@@ -87,9 +87,14 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     private var lastAttempt = Date.distantPast
     private var fetching = false
     private var session: URLSession?
+    private let locationIOEnabled = ProcessInfo.processInfo.environment["SNOOPY_DISABLE_ENVIRONMENT_IO"] != "1"
 
     override init() {
-        super.init(); manager.delegate = self; manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        super.init()
+        if locationIOEnabled {
+            manager.delegate = self
+            manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        }
         if let data = UserDefaults.standard.data(forKey: "SnoopyWeatherCache.v3") {
             cache = try? JSONDecoder().decode(WeatherCache.self, from: data)
         }
@@ -101,12 +106,14 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     }
     func start() {
         onUpdate?()
+        guard locationIOEnabled else { return }
         if manager.authorizationStatus == .notDetermined { manager.requestWhenInUseAuthorization() }
         else if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways { manager.requestLocation() }
         else { fetch(fallbackLocation()) }
     }
     func refreshIfNeeded() {
-        guard Date().timeIntervalSince(cache?.fetchedAt ?? .distantPast) > 30 * 60,
+        guard locationIOEnabled,
+              Date().timeIntervalSince(cache?.fetchedAt ?? .distantPast) > 30 * 60,
               Date().timeIntervalSince(lastAttempt) > 5 * 60 else { return }
         manager.requestLocation()
     }

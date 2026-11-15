@@ -35,8 +35,8 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     private var watchdog: DispatchWorkItem?
     private var bootstrapLayer: CALayer?
     private var preparedIdle: IdleScenePlayback?
-    private var retiringActives: [ActivePlayback] = []
-    private var retiringIdles: [IdleScenePlayback] = []
+    private var retiringActive: ActivePlayback?
+    private var retiringIdle: IdleScenePlayback?
     private var generation = 0
     private var lastTransitionPairID: String?
     private var revealedPlayerID: ObjectIdentifier?
@@ -117,6 +117,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         guard sessionActive else { return }
         let now = Date()
         idle?.tick(now)
+        retiringIdle?.tick(now)
         if now >= nextEnvironmentRefresh {
             nextEnvironmentRefresh = now.addingTimeInterval(60)
             environment.refreshIfNeeded()
@@ -156,8 +157,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         transitionOverride: TransitionChoice? = nil
     ) {
         guard sessionActive, let catalog, let root = layer else { return }
-        removeObservers(); watchdog?.cancel(); watchdog = nil
-        let oldActive = active, oldIdle = idle
+        let oldActive = active
         let incoming: IdleScenePlayback
         if let preparedIdle {
             incoming = preparedIdle
@@ -172,8 +172,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
                 frame: bounds, targetDuration: duration
             )
         }
-        retainForTransition(oldActive)
-        retainForTransition(oldIdle)
+        retireCurrentScene()
         incoming.container.opacity = 0
         incoming.container.removeFromSuperlayer()
         idle = incoming; active = nil; root.addSublayer(incoming.container); incoming.start(); incoming.tick()
@@ -192,25 +191,23 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         lastTransitionPairID = choice.pairID
         NSLog("Snoopy transition %@ (%@) Active->Idle", choice.style.rawValue, choice.pairID)
         TransitionAnimator.reveal(
-            incoming: incoming.container, over: oldActive?.container ?? oldIdle?.container ?? bootstrapLayer,
+            incoming: incoming.container, over: retiringLayer ?? bootstrapLayer,
             style: choice.style, in: bounds
         ) { [weak self, weak incoming] in
             guard let self, let incoming, self.idle === incoming else { return }
-            self.finishRetiring(oldActive)
-            self.finishRetiring(oldIdle)
-            self.bootstrapLayer?.removeFromSuperlayer(); self.bootstrapLayer = nil
+            self.finishTransition()
         }
     }
 
     private func playActive() {
         guard sessionActive, let catalog, let root = layer else { return }
-        removeObservers(); watchdog?.cancel(); watchdog = nil
-        preparedIdle?.stop(); preparedIdle?.container.removeFromSuperlayer(); preparedIdle = nil
-        let outgoingIdle = idle, oldActive = active
         guard let scene = catalog.selectActive(environment: environment.snapshot(), scorer: scorer),
-              let sprite = scene.sprites.first, let url = sprite.movieURL else { return }
-        retainForTransition(oldActive)
-        retainForTransition(outgoingIdle)
+              let url = scene.activeMovieURL else {
+            if active == nil { playIdle() }
+            return
+        }
+        preparedIdle?.stop(); preparedIdle?.container.removeFromSuperlayer(); preparedIdle = nil
+        retireCurrentScene()
         let item = AVPlayerItem(url: url), player = AVPlayer(playerItem: item)
         player.isMuted = true; player.volume = 0; player.actionAtItemEnd = .pause
         let container = CALayer(); container.frame = bounds; container.backgroundColor = NSColor.black.cgColor
@@ -224,7 +221,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             container: container, player: player, playerLayer: video, scene: scene, startedAt: Date()
         )
         active = playback; revealedPlayerID = nil
-        let isInitialScene = outgoingIdle == nil && oldActive == nil
+        let isInitialScene = retiringLayer == nil
         let choice = isInitialScene
             ? TransitionChoice(pairID:"initial-dissolve", style:.dissolve, preventsIdleSceneChange:false)
             : catalog.transitionChoice(
@@ -241,24 +238,35 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             let id = ObjectIdentifier(player)
             guard self.revealedPlayerID != id else { return }
             self.revealedPlayerID = id
+            self.watchdog?.cancel(); self.watchdog = nil
             self.installActiveExitSchedule(item: item, playback: playback, choice: exitChoice)
             player.play()
             TransitionAnimator.reveal(
-                incoming: container, over: oldActive?.container ?? outgoingIdle?.container ?? self.bootstrapLayer,
+                incoming: container, over: self.retiringLayer ?? self.bootstrapLayer,
                 style: choice.style, in: self.bounds
             ) { [weak self, weak player] in
                 guard let self, let player, self.active?.player === player else { return }
-                self.finishRetiring(oldActive)
-                self.finishRetiring(outgoingIdle)
-                if let outgoingIdle, self.idle === outgoingIdle { self.idle = nil }
-                self.bootstrapLayer?.removeFromSuperlayer(); self.bootstrapLayer = nil
+                self.finishTransition()
             }
         }
         readiness = item.observe(\.status, options: [.initial, .new]) { [weak self, weak player] item, _ in
-            guard item.status == .readyToPlay, let self, let player, self.active?.player === player else { return }
-            DispatchQueue.main.async { player.preroll(atRate: 1) { _ in DispatchQueue.main.async(execute: reveal) } }
+            DispatchQueue.main.async {
+                guard let self, let player, self.active?.player === player else { return }
+                if item.status == .failed {
+                    self.playIdle(transitionOverride: exitChoice)
+                } else if item.status == .readyToPlay {
+                    player.preroll(atRate: 1) { success in
+                        if success { DispatchQueue.main.async(execute: reveal) }
+                    }
+                }
+            }
         }
-        let timeout = DispatchWorkItem(block: reveal); watchdog = timeout
+        let timeout = DispatchWorkItem { [weak self, weak player] in
+            guard let self, let player, self.active?.player === player else { return }
+            if item.status == .readyToPlay { reveal() }
+            else { self.playIdle(transitionOverride: exitChoice) }
+        }
+        watchdog = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
     }
 
@@ -344,30 +352,39 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         playback.container.removeFromSuperlayer()
     }
 
-    private func retainForTransition(_ playback: ActivePlayback?) {
-        guard let playback,
-              !retiringActives.contains(where: { $0.player === playback.player }) else { return }
-        retiringActives.append(playback)
+    private var retiringLayer: CALayer? {
+        retiringActive?.container ?? retiringIdle?.container
     }
 
-    private func retainForTransition(_ playback: IdleScenePlayback?) {
-        guard let playback,
-              !retiringIdles.contains(where: { $0 === playback }) else { return }
-        retiringIdles.append(playback)
+    private func retireCurrentScene() {
+        removeObservers()
+        watchdog?.cancel(); watchdog = nil
+        if let active, revealedPlayerID == nil {
+            // Keep the existing outgoing scene while discarding the unseen player.
+            stop(active)
+        } else {
+            clearRetiringScene()
+            retiringActive = active
+            retiringIdle = idle
+            if let retiringLayer { TransitionAnimator.finishReveal(retiringLayer) }
+        }
+        active = nil
+        idle = nil
+        revealedPlayerID = nil
     }
 
-    private func finishRetiring(_ playback: ActivePlayback?) {
-        guard let playback else { return }
-        stop(playback)
-        retiringActives.removeAll { $0.player === playback.player }
+    private func finishTransition() {
+        clearRetiringScene()
+        bootstrapLayer?.removeFromSuperlayer(); bootstrapLayer = nil
     }
 
-    private func finishRetiring(_ playback: IdleScenePlayback?) {
-        guard let playback else { return }
-        playback.stop()
-        playback.container.removeAllAnimations()
-        playback.container.removeFromSuperlayer()
-        retiringIdles.removeAll { $0 === playback }
+    private func clearRetiringScene() {
+        stop(retiringActive)
+        retiringIdle?.stop()
+        retiringIdle?.container.removeAllAnimations()
+        retiringIdle?.container.removeFromSuperlayer()
+        retiringActive = nil
+        retiringIdle = nil
     }
 
     private func showBootstrap() {
@@ -379,7 +396,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
 
     private func shutdown() {
         guard sessionActive || idle != nil || active != nil || preparedIdle != nil
-                || !retiringActives.isEmpty || !retiringIdles.isEmpty else {
+                || retiringLayer != nil else {
             _ = releaseActiveSlot()
             return
         }
@@ -391,11 +408,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         idle?.stop(); idle?.container.removeAllAnimations(); idle?.container.removeFromSuperlayer()
         preparedIdle?.stop(); preparedIdle?.container.removeAllAnimations(); preparedIdle?.container.removeFromSuperlayer()
         stop(active)
-        retiringActives.forEach { stop($0) }
-        retiringIdles.forEach {
-            $0.stop(); $0.container.removeAllAnimations(); $0.container.removeFromSuperlayer()
-        }
-        retiringActives.removeAll(); retiringIdles.removeAll()
+        clearRetiringScene()
         idle = nil; active = nil; preparedIdle = nil
         revealedPlayerID = nil
         environment.stop()

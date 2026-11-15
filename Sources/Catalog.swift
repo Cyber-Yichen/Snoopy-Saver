@@ -107,8 +107,12 @@ final class AssetCatalog {
     private var byKind: [AssetKind: [AssetRecord]] = [:]
     private var byID: [String: AssetRecord] = [:]
 
-    init(bundle: Bundle) throws {
+    convenience init(bundle: Bundle) throws {
         guard let resources = bundle.resourceURL else { throw CatalogError.missingResources }
+        try self.init(resources: resources)
+    }
+
+    init(resources: URL) throws {
         let root = resources.appendingPathComponent("Assets", isDirectory: true)
         guard FileManager.default.fileExists(atPath: root.path) else { throw CatalogError.missingAssets }
         let enumerator = FileManager.default.enumerator(
@@ -119,6 +123,7 @@ final class AssetCatalog {
             guard directory.pathExtension == "icasset" else { continue }
             enumerator?.skipDescendants()
             guard let record = Self.parse(directory) else { continue }
+            if record.kind == .activeScene, record.activeMovieURL == nil { continue }
             let key = "\(record.kind.rawValue)/\(record.identifier)"
             if let old = preferred[key], old.sourcePriority >= record.sourcePriority { continue }
             preferred[key] = record
@@ -126,13 +131,14 @@ final class AssetCatalog {
         records = preferred.values.sorted { ($0.kind.rawValue, $0.identifier) < ($1.kind.rawValue, $1.identifier) }
         byKind = Dictionary(grouping: records, by: \.kind)
         byID = Dictionary(uniqueKeysWithValues: records.map { ("\($0.kind.rawValue)/\($0.identifier)", $0) })
-        guard !assets(.activeScene).isEmpty, !assets(.idleScene).isEmpty else { throw CatalogError.noScenes }
+        guard !assets(.idleScene).isEmpty else { throw CatalogError.noScenes }
     }
 
     func assets(_ kind: AssetKind) -> [AssetRecord] { byKind[kind] ?? [] }
 
     func selectActive(environment: EnvironmentSnapshot, scorer: RelevancyEngine) -> AssetRecord? {
-        guard let result = scorer.choose(assets(.activeScene), kind: "activeScene", environment: environment) else { return nil }
+        let playable = assets(.activeScene).filter { $0.activeMovieURL != nil }
+        guard let result = scorer.choose(playable, kind: "activeScene", environment: environment) else { return nil }
         scorer.mark(result, kind: "activeScene", at: environment.date)
         return result
     }

@@ -4,15 +4,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 TOOLCHAIN="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain"
 SWIFT_LIB="$TOOLCHAIN/usr/lib/swift/macosx"
-BUILD="$ROOT/.build/SnoopyScreenSaver"
+BUILD="${SNOOPY_BUILD_DIR:-$ROOT/.build/SnoopyScreenSaver}"
+MODULE_CACHE="$ROOT/.build/ModuleCache"
 BUNDLE="$BUILD/SnoopyScreenSaver.saver"
 WITH_ASSETS=1
 [[ "${1:-}" == "--code-only" ]] && WITH_ASSETS=0
 rm -rf "$BUILD"
-mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources" "$MODULE_CACHE"
 for ARCH in arm64 x86_64; do
   mkdir -p "$BUILD/$ARCH"
   xcrun swiftc -swift-version 5 -target "$ARCH-apple-macosx12.0" -sdk "$SDK" \
+    -module-cache-path "$MODULE_CACHE" \
     -parse-as-library -whole-module-optimization -emit-object -module-name SnoopyScreenSaver \
     "$ROOT"/Sources/*.swift -o "$BUILD/$ARCH/SnoopyScreenSaver.o"
   xcrun clang -target "$ARCH-apple-macosx12.0" -isysroot "$SDK" -bundle \

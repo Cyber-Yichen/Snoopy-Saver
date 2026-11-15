@@ -8,7 +8,7 @@ import QuartzCore
 /// still leaves the expensive HEIF decompression for `CALayer` to perform.
 /// The immediate thumbnail below guarantees that layers only ever receive
 /// decoded pixels. A bounded shared cache and two workers limit memory and CPU.
-private final class FrameDecoder {
+final class FrameDecoder {
     private final class Entry {
         let image: CGImage
         let cost: Int
@@ -29,10 +29,12 @@ private final class FrameDecoder {
 
     private let cache = NSCache<NSString, Entry>()
     private let queue: OperationQueue
+    private let decode: (URL, Int) -> CGImage?
     private let lock = NSLock()
     private var inFlight: [String: Request] = [:]
 
-    private init() {
+    init(decode: @escaping (URL, Int) -> CGImage? = FrameDecoder.decodeImage) {
+        self.decode = decode
         cache.countLimit = 64
         cache.totalCostLimit = 256 * 1024 * 1024
         queue = OperationQueue()
@@ -56,12 +58,13 @@ private final class FrameDecoder {
         completion: Callback? = nil
     ) {
         let cacheKey = key(for: url, maxPixelSize: maxPixelSize)
+        lock.lock()
         if let image = cache.object(forKey: cacheKey as NSString)?.image {
+            lock.unlock()
             completion?(image)
             return
         }
 
-        lock.lock()
         if let request = inFlight[cacheKey] {
             request.clients.insert(clientID)
             if let completion { request.callbacks[clientID, default: []].append(completion) }
@@ -76,16 +79,12 @@ private final class FrameDecoder {
         inFlight[cacheKey] = request
         lock.unlock()
 
-        operation.addExecutionBlock { [weak self, weak operation] in
-            guard let self, operation?.isCancelled == false else { return }
+        operation.addExecutionBlock { [weak self, weak request] in
+            guard let self, let request, request.operation?.isCancelled == false else { return }
             let image = autoreleasepool {
-                Self.decode(url, maxPixelSize: maxPixelSize)
+                self.decode(url, maxPixelSize)
             }
-            guard operation?.isCancelled == false else {
-                self.finish(cacheKey, image: nil)
-                return
-            }
-            self.finish(cacheKey, image: image)
+            self.finish(cacheKey, request: request, image: image)
         }
         queue.addOperation(operation)
     }
@@ -108,28 +107,31 @@ private final class FrameDecoder {
         lock.lock()
         let operations = inFlight.values.compactMap(\.operation)
         inFlight.removeAll()
+        cache.removeAllObjects()
         lock.unlock()
         operations.forEach { $0.cancel() }
-        cache.removeAllObjects()
     }
 
-    private func finish(_ cacheKey: String, image: CGImage?) {
+    private func finish(_ cacheKey: String, request: Request, image: CGImage?) {
         lock.lock()
-        let request = inFlight.removeValue(forKey: cacheKey)
-        lock.unlock()
-        guard let request else { return }
+        guard inFlight[cacheKey] === request else {
+            lock.unlock()
+            return
+        }
+        inFlight.removeValue(forKey: cacheKey)
         if let image {
             let entry = Entry(image)
             cache.setObject(entry, forKey: cacheKey as NSString, cost: entry.cost)
         }
         let callbacks = request.callbacks.values.flatMap { $0 }
+        lock.unlock()
         guard !callbacks.isEmpty else { return }
         OperationQueue.main.addOperation {
             callbacks.forEach { $0(image) }
         }
     }
 
-    private static func decode(_ url: URL, maxPixelSize: Int) -> CGImage? {
+    private static func decodeImage(_ url: URL, maxPixelSize: Int) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(
             url as CFURL,
             [kCGImageSourceShouldCache: false] as CFDictionary

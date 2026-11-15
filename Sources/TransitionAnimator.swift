@@ -35,6 +35,14 @@ enum TransitionAnimator {
         }
     }
 
+    static func finishReveal(_ layer: CALayer) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layer.mask = nil
+        layer.removeAnimation(forKey: "snoopyFadeIn")
+        layer.opacity = 1
+        CATransaction.commit()
+    }
+
     private static func fade(incoming: CALayer, outgoing: CALayer?, completion: @escaping () -> Void) {
         let interval = duration(for: .dissolve)
         let fadeIn = CABasicAnimation(keyPath: "opacity")
