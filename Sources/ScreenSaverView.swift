@@ -47,6 +47,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     private var transition: TransitionAnimator?
     private var revealedPlayerID: ObjectIdentifier?
     private var activeStarted = false
+    private var didStartIdleScene = false
     private var sessionActive = false
     private var coordinatorKey: String?
     private var nextEnvironmentRefresh = Date.distantPast
@@ -123,8 +124,8 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     override func animateOneFrame() {
         guard sessionActive else { return }
         let now = Date()
-        idle?.tick(now)
-        retiringIdle?.tick(now)
+        idle?.tick()
+        retiringIdle?.tick()
         if now >= nextEnvironmentRefresh {
             nextEnvironmentRefresh = now.addingTimeInterval(60)
             environment.refreshIfNeeded()
@@ -138,6 +139,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             else { $0.frame = bounds }
         }
         retiringIdle?.resize(bounds)
+        preparedIdle?.resize(bounds)
         retiringActive?.container.frame = bounds
         retiringActive?.playerLayer.frame = bounds
         transition?.resize()
@@ -151,6 +153,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     @objc func idleTargetDurationForTesting() -> Double { idle?.targetDuration ?? 0 }
     @objc func idleCharacterAnimationCountForTesting() -> Int { idle?.specialAnimationCount ?? 0 }
     @objc func idleHalftonePresentForTesting() -> Bool { idle?.debugHasHalftone ?? false }
+    @objc func idleActivityForTesting() -> NSNumber { NSNumber(value: idle?.debugActivity ?? 0) }
     @objc func sessionActiveForTesting() -> Bool { sessionActive }
     @objc class func activeInstanceCountForTesting() -> Int {
         activeViews = activeViews.filter { $0.value.value != nil }
@@ -198,7 +201,8 @@ final class SnoopyScreenSaverView: ScreenSaverView {
                 self.lastRevealPoseID = choice?.revealPose?.identifier ?? self.lastRevealPoseID
                 self.logSpriteTransition(choice, direction: "Active->Idle")
             }
-            incoming.start()
+            incoming.start(firstScene: !self.didStartIdleScene)
+            self.didStartIdleScene = true
         }) { [weak self, weak incoming] in
             guard let self, let incoming, self.idle === incoming else { return }
             incoming.clearTransitionPose()
@@ -399,6 +403,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
 
     private func retireCurrentScene() {
         transition?.cancel(); transition = nil
+        idle?.stopScheduling()
         idle?.clearTransitionPose()
         removeObservers()
         watchdog?.cancel(); watchdog = nil
@@ -459,6 +464,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         revealedPlayerID = nil
         activeStarted = false
         consecutivePreservedIdleScenes = 0
+        didStartIdleScene = false
         lastTransitionPairID = nil; lastRevealPoseID = nil
         environment.stop()
         layer?.sublayers?.forEach {
@@ -467,7 +473,10 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             $0.removeFromSuperlayer()
         }
         bootstrapLayer = nil
-        if releaseActiveSlot() { SpriteAssetPlayer.purgeCaches() }
+        if releaseActiveSlot() {
+            SpriteAssetPlayer.purgeCaches()
+            TransitionFrames.purgeCache()
+        }
     }
 
     private func claimActiveSlot() {

@@ -69,6 +69,9 @@ struct EnvironmentSnapshot {
 }
 
 struct SpriteDescriptor {
+    // IdleCharacterCore.SpriteTiming uses a 24 fps asset time base.
+    static let framesPerSecond: Double = 24
+
     let baseName: String
     let directoryURL: URL
     let mediaType: SpriteMediaType
@@ -82,6 +85,7 @@ struct SpriteDescriptor {
     let digitCount: Int
 
     var frameCount: Int { max(1, endFrame - startFrame + 1) }
+    var frameDuration: TimeInterval { Double(frameCount) / Self.framesPerSecond }
     var movieURL: URL? {
         let url = directoryURL.appendingPathComponent(baseName).appendingPathExtension("mov")
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
@@ -126,6 +130,7 @@ struct AssetRecord {
     let excludedMoments: Set<String>
     let excludedPalettes: Set<String>
     let excludedVisitors: Set<String>
+    let parentIdleSceneIDs: Set<String>
     let palette: Palette?
 }
 
@@ -144,8 +149,7 @@ struct TransitionChoice {
 }
 
 struct TransitionSequence {
-    // IdleCharacterCore.SpriteTiming uses a 24 fps frame time base on tvOS 27.2.
-    static let framesPerSecond: Double = 24
+    static let framesPerSecond = SpriteDescriptor.framesPerSecond
 
     let mask: SpriteDescriptor
     let outline: SpriteDescriptor

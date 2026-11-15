@@ -82,6 +82,38 @@ struct RuntimeSmoke {
         )
 
         let environment = ProcessInfo.processInfo.environment
+        if let idleSeconds = Double(environment["SNOOPY_RUNTIME_IDLE_SECONDS"] ?? ""), idleSeconds > 0 {
+            let activity = NSSelectorFromString("idleActivityForTesting")
+            try require(view.responds(to: activity), "missing IdleScene activity probe")
+            view.perform(NSSelectorFromString("forceLongIdleSceneForTesting"))
+            var observedCharacter = false
+            var observedVisitor = false
+            var overlap = false
+            var capture: Process?
+            spin(seconds: idleSeconds) {
+                view.animateOneFrame()
+                samplePlayback()
+                let flags = (view.perform(activity)?.takeUnretainedValue() as? NSNumber)?.intValue ?? 0
+                observedCharacter = observedCharacter || flags & 1 != 0
+                observedVisitor = observedVisitor || flags & 2 != 0
+                overlap = overlap || (flags & 2 != 0 && flags & 5 != 0)
+                if capture == nil, flags & 3 != 0,
+                   let path = environment["SNOOPY_RUNTIME_SCREENSHOT"],
+                   rootLayers(of: view).flatMap({ $0.sublayers ?? [] }).contains(where: {
+                       ($0 as? AVPlayerLayer)?.isReadyForDisplay == true
+                   }) {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                    process.arguments = ["-x", "-l", String(window.windowNumber), path]
+                    if (try? process.run()) != nil { capture = process }
+                }
+            }
+            try require(!overlap, "visitor overlapped a character event or transition pose")
+            try require(observedCharacter, "no IdleScene character event ran")
+            try require(observedVisitor, "no IdleScene visitor ran")
+            if let capture { capture.waitUntilExit() }
+            print("IdleScene pacing: character and visitor events observed with no overlap.")
+        }
         let switchCount = Int(environment["SNOOPY_RUNTIME_SWITCHES"] ?? "") ?? 8
         let dwell = Double(environment["SNOOPY_RUNTIME_DWELL"] ?? "") ?? 5
         for index in 0..<switchCount {

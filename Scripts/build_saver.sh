@@ -6,24 +6,42 @@ TOOLCHAIN="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xc
 SWIFT_LIB="$TOOLCHAIN/usr/lib/swift/macosx"
 BUILD="${SNOOPY_BUILD_DIR:-$ROOT/.build/SnoopyScreenSaver}"
 MODULE_CACHE="$ROOT/.build/ModuleCache"
-BUNDLE="$BUILD/SnoopyScreenSaver.saver"
+DESTINATION="$BUILD/SnoopyScreenSaver.saver"
+if [[ "${1:-}" != "--locked" ]]; then
+  mkdir -p "$BUILD"
+  exec /usr/bin/lockf -k "$BUILD/.snoopy-build.lock" /bin/bash "$0" --locked "$@"
+fi
+shift
 WITH_ASSETS=1
 [[ "${1:-}" == "--code-only" ]] && WITH_ASSETS=0
-rm -rf "$BUILD"
+STAGING="$(mktemp -d "$BUILD/.snoopy-build.XXXXXXXX")"
+BACKUP="$STAGING/previous.saver"
+cleanup() {
+  local result=$?
+  if [[ -e "$BACKUP" && ! -e "$DESTINATION" ]] && ! mv "$BACKUP" "$DESTINATION"; then
+    echo "Could not restore the previous build at $BACKUP" >&2
+    exit 1
+  fi
+  rm -rf "$STAGING"
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+BUNDLE="$STAGING/SnoopyScreenSaver.saver"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources" "$MODULE_CACHE"
 for ARCH in arm64 x86_64; do
-  mkdir -p "$BUILD/$ARCH"
+  mkdir -p "$STAGING/$ARCH"
   xcrun swiftc -swift-version 5 -target "$ARCH-apple-macosx12.0" -sdk "$SDK" \
     -module-cache-path "$MODULE_CACHE" \
     -parse-as-library -whole-module-optimization -emit-object -module-name SnoopyScreenSaver \
-    "$ROOT"/Sources/*.swift -o "$BUILD/$ARCH/SnoopyScreenSaver.o"
+    "$ROOT"/Sources/*.swift -o "$STAGING/$ARCH/SnoopyScreenSaver.o"
   xcrun clang -target "$ARCH-apple-macosx12.0" -isysroot "$SDK" -bundle \
-    "$BUILD/$ARCH/SnoopyScreenSaver.o" -L"$SDK/usr/lib/swift" -L/usr/lib/swift -L"$SWIFT_LIB" \
+    "$STAGING/$ARCH/SnoopyScreenSaver.o" -L"$SDK/usr/lib/swift" -L/usr/lib/swift -L"$SWIFT_LIB" \
     -lswiftCore -lswiftFoundation -lswiftAppKit -lswiftAVFoundation -lswiftCoreLocation \
     -framework AppKit -framework AVFoundation -framework CoreLocation -framework ImageIO \
-    -framework QuartzCore -framework ScreenSaver -o "$BUILD/$ARCH/SnoopyScreenSaver"
+    -framework QuartzCore -framework ScreenSaver -o "$STAGING/$ARCH/SnoopyScreenSaver"
 done
-xcrun lipo -create "$BUILD/arm64/SnoopyScreenSaver" "$BUILD/x86_64/SnoopyScreenSaver" \
+xcrun lipo -create "$STAGING/arm64/SnoopyScreenSaver" "$STAGING/x86_64/SnoopyScreenSaver" \
   -output "$BUNDLE/Contents/MacOS/SnoopyScreenSaver"
 cp "$ROOT/Info.plist" "$BUNDLE/Contents/Info.plist"
 if [[ "$WITH_ASSETS" -eq 1 ]]; then
@@ -45,4 +63,7 @@ if [[ -f "$ROOT/Assets/thumbnail.png" ]]; then
   cp "$ROOT/Assets/thumbnail@2x.png" "$BUNDLE/Contents/Resources/thumbnail@2x.png"
 fi
 codesign --force --sign - --timestamp=none "$BUNDLE"
-echo "$BUNDLE"
+codesign --verify --deep --strict "$BUNDLE"
+if [[ -e "$DESTINATION" ]]; then mv "$DESTINATION" "$BACKUP"; fi
+mv "$BUNDLE" "$DESTINATION"
+echo "$DESTINATION"

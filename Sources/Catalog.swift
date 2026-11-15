@@ -87,7 +87,9 @@ final class RelevancyEngine {
         if let maximum = scored.map(\.1).max() {
             return scored.filter { abs($0.1 - maximum) < 0.000_001 }.randomElement()?.0
         }
-        return assets.filter { $0.relevancy.info.isEmpty }.randomElement()
+        // Generic candidates already participate in scoring. A second pass
+        // based on info alone would bypass dependencies and exclusions.
+        return nil
     }
 
     func mark(_ asset: AssetRecord, kind: String, at date: Date) {
@@ -146,18 +148,28 @@ final class AssetCatalog {
     func makeIdleComposition(environment: EnvironmentSnapshot, scorer: RelevancyEngine) -> IdleComposition? {
         guard let scene = scorer.choose(assets(.idleScene), kind: "idleScene", environment: environment) else { return nil }
         scorer.mark(scene, kind: "idleScene", at: environment.date)
-        let effects = assets(.idleSceneVisitor).filter {
-            $0.isFullscreenEffect && !scene.excludedVisitors.contains($0.identifier)
+        let effects = assets(.idleSceneVisitor).filter { effect in
+            effect.isFullscreenEffect && !scene.excludedVisitors.contains(effect.identifier)
+                && !scene.relevancy.exclusions.contains {
+                    $0.category == "sceneFullscreenEffectVisitor" && $0.facts.intersects(effect.relevancy.info)
+                }
         }
         let effect = scorer.choose(effects, kind: "fullscreenEffect", environment: environment)
         if let effect { scorer.mark(effect, kind: "fullscreenEffect", at: environment.date) }
         let dependency: [RelevancyClause] = effect.map {
             [RelevancyClause(category: "sceneFullscreenEffectVisitor", facts: $0.relevancy.info)]
         } ?? []
-        let palettes = assets(.scenePalette).filter { !scene.excludedPalettes.contains($0.identifier) }
+        let palettes = assets(.scenePalette).filter {
+            !scene.excludedPalettes.contains($0.identifier)
+                && ($0.parentIdleSceneIDs.isEmpty || $0.parentIdleSceneIDs.contains(scene.identifier))
+        }
+        let scoped = palettes.filter { !$0.parentIdleSceneIDs.isEmpty }
+        let global = palettes.filter { $0.parentIdleSceneIDs.isEmpty }
         let palette = scorer.choose(
-            palettes, kind: "scenePalette", environment: environment, dependencyEnvironment: dependency
-        )
+            scoped, kind: "scenePalette", environment: environment, dependencyEnvironment: dependency
+        ) ?? scorer.choose(
+            global, kind: "scenePalette", environment: environment, dependencyEnvironment: dependency
+        ) ?? neutralPalette(from: global, environment: environment, dependency: dependency, scorer: scorer)
         if let palette { scorer.mark(palette, kind: "scenePalette", at: environment.date) }
         guard let base = scorer.choose(
             assets(.characterBasePose), kind: "basePose", environment: environment,
@@ -167,24 +179,44 @@ final class AssetCatalog {
         return IdleComposition(scene: scene, palette: palette, basePose: base, fullscreenEffect: effect)
     }
 
+    private func neutralPalette(
+        from palettes: [AssetRecord], environment: EnvironmentSnapshot,
+        dependency: [RelevancyClause], scorer: RelevancyEngine
+    ) -> AssetRecord? {
+        // The bundled global palette pool has no generic clear/unknown
+        // entry. Use its cloudy palette for the same time band as a local
+        // visual fallback, without changing weather or enabling an effect.
+        var facts = environment.facts
+        facts.weather.insert("cloudy")
+        let neutral = EnvironmentSnapshot(
+            date: environment.date, facts: facts, previousWeather: environment.previousWeather,
+            sunrise: environment.sunrise, sunset: environment.sunset
+        )
+        return scorer.choose(
+            palettes.filter { $0.relevancy.info.weather == ["cloudy"] },
+            kind: "scenePalette", environment: neutral, dependencyEnvironment: dependency
+        )
+    }
+
     func selectCharacterAnimation(
         from poseID: String,
         kind: AssetKind,
         scene: AssetRecord,
         environment: EnvironmentSnapshot,
         dependencyEnvironment: [RelevancyClause],
-        scorer: RelevancyEngine
+        scorer: RelevancyEngine,
+        eligible: (AssetRecord) -> Bool = { _ in true }
     ) -> AssetRecord? {
         let candidates = assets(kind).filter {
             $0.startPoseID == poseID
                 && (kind != .characterMoment || !scene.excludedMoments.contains($0.identifier))
                 && (kind != .characterAdditionalPose || !scene.excludedAdditionalPoses.contains($0.identifier))
+                && eligible($0)
         }
         guard let result = scorer.choose(
             candidates, kind: kind.rawValue, environment: environment,
             dependencyEnvironment: dependencyEnvironment
         ) else { return nil }
-        scorer.mark(result, kind: kind.rawValue, at: environment.date)
         return result
     }
 
@@ -205,7 +237,6 @@ final class AssetCatalog {
             candidates, kind: "visitor", environment: environment,
             dependencyEnvironment: dependencyEnvironment
         ) else { return nil }
-        scorer.mark(result, kind: "visitor", at: environment.date)
         return result
     }
 
@@ -323,6 +354,7 @@ final class AssetCatalog {
             excludedMoments: Set(exclusions["excludedCharacterMoments"] as? [String] ?? []),
             excludedPalettes: Set(exclusions["excludedPalettes"] as? [String] ?? []),
             excludedVisitors: Set(exclusions["excludedVisitors"] as? [String] ?? []),
+            parentIdleSceneIDs: Set(payload["parentIdleSceneIDs"] as? [String] ?? []),
             palette: palette
         )
     }

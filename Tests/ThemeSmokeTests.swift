@@ -14,8 +14,21 @@ struct ThemeSmokeTests {
         )
         _ = try addAsset("Optional/A", kind: "activeScene", in: assets)
         _ = try addAsset("Optional/B", kind: "activeScene", in: assets)
-        _ = try addAsset("DefaultAssetBundle/Idle", kind: "idleScene", in: assets)
+        let rain: [[String: Any]] = [["weather": ["condition": "rainy"]]]
+        let excludesRain: [[String: Any]] = [["category": "sceneFullscreenEffectVisitor", "info": rain]]
+        _ = try addAsset("DefaultAssetBundle/Idle", kind: "idleScene", in: assets,
+                         fields: ["relevancyData": ["exclusions": excludesRain]])
         _ = try addAsset("DefaultAssetBundle/Pose", kind: "characterBasePose", in: assets)
+        _ = try addAsset("RainEffect", kind: "idleSceneVisitor", in: assets, includeMovie: true,
+                         fields: ["isFullscreenEffect": true, "relevancyData": ["info": rain]])
+        _ = try addAsset("Visitor", kind: "idleSceneVisitor", in: assets, includeMovie: true,
+                         fields: ["relevancyData": ["exclusions": excludesRain]])
+        let color = ["red": 255, "green": 200, "blue": 100, "alpha": 1]
+        _ = try addAsset("WrongPalette", kind: "scenePalette", in: assets, fields: [
+            "backgroundColor": color, "parentIdleSceneIDs": ["DifferentScene"], "relevancyData": ["info": rain],
+        ])
+        _ = try addAsset("IdlePalette", kind: "scenePalette", in: assets,
+                         fields: ["backgroundColor": color, "parentIdleSceneIDs": ["Idle"]])
         try addTransitionFixture(in: assets)
 
         let catalog = try AssetCatalog(resources: resources)
@@ -23,6 +36,24 @@ struct ThemeSmokeTests {
             date: Date(), facts: RelevancyFacts(), previousWeather: nil, sunrise: nil, sunset: nil
         )
         let scorer = RelevancyEngine()
+        var wetFacts = RelevancyFacts()
+        wetFacts.weather = ["rainy"]
+        let wetEnvironment = EnvironmentSnapshot(
+            date: environment.date, facts: wetFacts, previousWeather: nil, sunrise: nil, sunset: nil
+        )
+        let wetComposition = catalog.makeIdleComposition(environment: wetEnvironment, scorer: RelevancyEngine())
+        precondition(wetComposition?.scene.identifier == "Idle" && wetComposition?.fullscreenEffect == nil)
+        precondition(wetComposition?.palette?.identifier == "IdlePalette")
+        if let scene = wetComposition?.scene {
+            let rainPlaying = RelevancyClause(category: "sceneFullscreenEffectVisitor", facts: wetFacts)
+            precondition(catalog.selectVisitor(
+                scene: scene, environment: wetEnvironment, dependencyEnvironment: [rainPlaying],
+                scorer: RelevancyEngine()
+            ) == nil)
+            precondition(catalog.selectVisitor(
+                scene: scene, environment: wetEnvironment, dependencyEnvironment: [], scorer: RelevancyEngine()
+            )?.identifier == "Visitor")
+        }
         precondition(catalog.assets(.activeScene).map(\.identifier) == ["A"])
         let active = catalog.assets(.activeScene)[0]
         precondition(active.activeMovieURL == movie)
@@ -42,7 +73,7 @@ struct ThemeSmokeTests {
         precondition(catalog.selectActive(environment: environment, scorer: scorer) == nil)
         let idleOnly = try AssetCatalog(resources: resources)
         precondition(idleOnly.makeIdleComposition(environment: environment, scorer: scorer) != nil)
-        print("Theme fixture passed: bundled media precedence, transition phase and pose resolution, IdleScene preservation filter, and missing-media fallback.")
+        print("Theme fixture passed: bundled media precedence, transition phases and poses, IdleScene preservation, weather and visitor exclusions, parent palettes, and missing-media fallback.")
 
         if CommandLine.arguments.count > 2 {
             let actualResources = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
@@ -53,7 +84,7 @@ struct ThemeSmokeTests {
             for date in environments {
                 let snapshot = EnvironmentProvider().snapshot(at: date)
                 precondition(actual.selectActive(environment: snapshot, scorer: RelevancyEngine())?.activeMovieURL != nil)
-                precondition(actual.makeIdleComposition(environment: snapshot, scorer: RelevancyEngine()) != nil)
+                precondition(actual.makeIdleComposition(environment: snapshot, scorer: RelevancyEngine())?.palette != nil)
             }
             print("Bundled catalog passed: \(actual.assets(.activeScene).count) playable ActiveScenes, \(actual.assets(.idleScene).count) IdleScenes, \(environments.count) dates.")
         }

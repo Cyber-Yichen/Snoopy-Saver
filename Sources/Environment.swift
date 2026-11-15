@@ -85,7 +85,8 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     private let manager = CLLocationManager()
     private var cache: WeatherCache?
     private var lastAttempt = Date.distantPast
-    private var fetching = false
+    private var requestID: UUID?
+    private var running = false
     private var session: URLSession?
     private let locationIOEnabled = ProcessInfo.processInfo.environment["SNOOPY_DISABLE_ENVIRONMENT_IO"] != "1"
 
@@ -101,21 +102,26 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     }
     deinit { stop() }
     func stop() {
+        running = false
+        requestID = nil
         manager.stopUpdatingLocation()
-        session?.invalidateAndCancel(); session = nil; fetching = false
+        session?.invalidateAndCancel(); session = nil
     }
     func start() {
+        running = true
         onUpdate?()
         guard locationIOEnabled else { return }
         if manager.authorizationStatus == .notDetermined { manager.requestWhenInUseAuthorization() }
-        else if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways { manager.requestLocation() }
-        else { fetch(fallbackLocation()) }
+        else { refreshIfNeeded() }
     }
     func refreshIfNeeded() {
-        guard locationIOEnabled,
+        guard running, locationIOEnabled, requestID == nil, manager.authorizationStatus != .notDetermined,
               Date().timeIntervalSince(cache?.fetchedAt ?? .distantPast) > 30 * 60,
               Date().timeIntervalSince(lastAttempt) > 5 * 60 else { return }
-        manager.requestLocation()
+        lastAttempt = Date()
+        if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways {
+            manager.requestLocation()
+        } else { fetch(fallbackLocation()) }
     }
     func snapshot(at date: Date = Date()) -> EnvironmentSnapshot {
         var facts = RelevancyFacts()
@@ -133,8 +139,7 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
                                    sunrise: cache?.sunrise, sunset: cache?.sunset)
     }
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways { manager.requestLocation() }
-        else if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted { fetch(fallbackLocation()) }
+        refreshIfNeeded()
     }
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         if let location = locations.last { fetch(location) }
@@ -142,18 +147,19 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) { fetch(fallbackLocation()) }
 
     private func fetch(_ location: CLLocation) {
-        guard !fetching else { return }; fetching = true; lastAttempt = Date()
-        guard var c = URLComponents(string: "https://api.open-meteo.com/v1/forecast") else {
-            fetching = false; return
-        }
+        guard running, requestID == nil,
+              var c = URLComponents(string: "https://api.open-meteo.com/v1/forecast") else { return }
         c.queryItems = [
-            .init(name:"latitude", value:String(format:"%.5f", location.coordinate.latitude)),
-            .init(name:"longitude", value:String(format:"%.5f", location.coordinate.longitude)),
+            .init(name:"latitude", value:String(format:"%.2f", location.coordinate.latitude)),
+            .init(name:"longitude", value:String(format:"%.2f", location.coordinate.longitude)),
             .init(name:"current", value:"weather_code,is_day,temperature_2m,wind_speed_10m"),
             .init(name:"daily", value:"weather_code,sunrise,sunset"), .init(name:"past_days", value:"1"),
             .init(name:"forecast_days", value:"1"), .init(name:"timezone", value:"auto"),
         ]
-        guard let url = c.url else { fetching = false; return }
+        guard let url = c.url else { return }
+        let expected = UUID()
+        requestID = expected
+        lastAttempt = Date()
         if session == nil {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 10
@@ -169,19 +175,23 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
                 return try? JSONDecoder().decode(WeatherResponse.self, from: data)
             }()
             guard let decoded else {
-                DispatchQueue.main.async { self?.fetching = false }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.requestID == expected else { return }
+                    self.requestID = nil
+                }
                 return
             }
             let current = Self.map(code: decoded.current.weatherCode, day: decoded.current.isDay == 1,
                                    temperature: decoded.current.temperature, wind: decoded.current.windSpeed)
             let previous = Self.map(code: decoded.daily.weatherCode.first ?? decoded.current.weatherCode,
                                     day: true, temperature: decoded.current.temperature, wind: 0)
+            let timeZone = decoded.timezone.flatMap(TimeZone.init(identifier:)) ?? .current
             let value = WeatherCache(fetchedAt: Date(), current: current.rawValue, previous: previous.rawValue,
-                                     sunrise: decoded.daily.sunrise.last.flatMap(Self.date),
-                                     sunset: decoded.daily.sunset.last.flatMap(Self.date))
+                                     sunrise: decoded.daily.sunrise.last.flatMap { Self.date($0, in: timeZone) },
+                                     sunset: decoded.daily.sunset.last.flatMap { Self.date($0, in: timeZone) })
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.fetching = false; self.cache = value
+                guard let self, self.requestID == expected else { return }
+                self.requestID = nil; self.cache = value
                 if let encoded = try? JSONEncoder().encode(value) {
                     UserDefaults.standard.set(encoded, forKey: "SnoopyWeatherCache.v3")
                 }
@@ -196,8 +206,8 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
         case 45...49: return .foggy; case 51...67,80...82: return .rainy; case 71...77,85,86: return .snowy;
         case 95...99: return .stormy; default: return .clear }
     }
-    private static func date(_ value: String) -> Date? {
-        let f = DateFormatter(); f.locale = Locale(identifier:"en_US_POSIX"); f.timeZone = .current; f.dateFormat = "yyyy-MM-dd'T'HH:mm"
+    private static func date(_ value: String, in timeZone: TimeZone) -> Date? {
+        let f = DateFormatter(); f.locale = Locale(identifier:"en_US_POSIX"); f.timeZone = timeZone; f.dateFormat = "yyyy-MM-dd'T'HH:mm"
         return f.date(from: value)
     }
     private func fallbackLocation() -> CLLocation {
@@ -216,5 +226,5 @@ private struct WeatherResponse: Decodable {
         enum CodingKeys: String, CodingKey { case weatherCode="weather_code", isDay="is_day", temperature="temperature_2m", windSpeed="wind_speed_10m" } }
     struct Daily: Decodable { let weatherCode: [Int]; let sunrise, sunset: [String]
         enum CodingKeys: String, CodingKey { case weatherCode="weather_code", sunrise, sunset } }
-    let current: Current; let daily: Daily
+    let current: Current; let daily: Daily; let timezone: String?
 }

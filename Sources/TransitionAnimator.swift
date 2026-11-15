@@ -14,6 +14,24 @@ final class TransitionFrames {
         let reveal: Phase
     }
 
+    private final class CachedPair {
+        let pair: Pair
+        let cost: Int
+
+        init(_ pair: Pair) {
+            self.pair = pair
+            cost = [pair.hide.mask, pair.hide.outline, pair.reveal.mask, pair.reveal.outline]
+                .joined().reduce(0) { $0 + $1.bytesPerRow * $1.height }
+        }
+    }
+
+    private static let cache: NSCache<NSString, CachedPair> = {
+        let cache = NSCache<NSString, CachedPair>()
+        cache.countLimit = 2
+        cache.totalCostLimit = 96 * 1024 * 1024
+        return cache
+    }()
+
     private static let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "local.snoopy.transition-decoder"
@@ -35,21 +53,32 @@ final class TransitionFrames {
         let aspect = Double(hide.mask.assetSize.width / hide.mask.assetSize.height)
         let boundedWidth = sqrt(48 * 1024 * 1024 * aspect / (4 * frameCount))
         let pixelSize = Int(min(max(320, pixelWidth), min(768, boundedWidth)))
+        let key = [hide.mask.directoryURL.path, reveal.mask.directoryURL.path, String(pixelSize)]
+            .joined(separator: "|") as NSString
+        if let cached = Self.cache.object(forKey: key) {
+            result = cached.pair
+            finished = true
+            return
+        }
         operation.addExecutionBlock { [weak self, weak operation] in
             guard let operation else { return }
-            let result: Pair? = autoreleasepool {
-                guard let hide = Self.decode(hide, pixelSize: pixelSize, operation: operation),
-                      let reveal = Self.decode(reveal, pixelSize: pixelSize, operation: operation)
-                else { return nil }
-                return Pair(hide: hide, reveal: reveal)
-            }
+            let result = Self.decodePair(hide: hide, reveal: reveal, pixelSize: pixelSize, operation: operation)
             guard !operation.isCancelled else { return }
-            DispatchQueue.main.async { [weak self] in self?.complete(result) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let result {
+                    let cached = CachedPair(result)
+                    Self.cache.setObject(cached, forKey: key, cost: cached.cost)
+                }
+                self.complete(result)
+            }
         }
         Self.queue.addOperation(operation)
     }
 
     deinit { operation.cancel() }
+
+    static func purgeCache() { cache.removeAllObjects() }
 
     func whenReady(_ callback: @escaping (Pair?) -> Void) {
         if finished { callback(result) }
@@ -80,6 +109,23 @@ final class TransitionFrames {
             outlines.append(outline)
         }
         return Phase(mask: masks, outline: outlines)
+    }
+
+    private static func decodePair(
+        hide: TransitionSequence, reveal: TransitionSequence, pixelSize: Int, operation: Operation
+    ) -> Pair? {
+        let sequences = [hide, reveal]
+        let lock = NSLock()
+        var phases: [Phase?] = [nil, nil]
+        // One pair is decoded at a time; the two phases are independent.
+        DispatchQueue.concurrentPerform(iterations: sequences.count) { index in
+            let phase = decode(sequences[index], pixelSize: pixelSize, operation: operation)
+            lock.lock()
+            phases[index] = phase
+            lock.unlock()
+        }
+        guard let hide = phases[0], let reveal = phases[1] else { return nil }
+        return Pair(hide: hide, reveal: reveal)
     }
 }
 

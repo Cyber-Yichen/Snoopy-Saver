@@ -164,7 +164,7 @@ final class SpriteAssetPlayer {
     private var workItems: [DispatchWorkItem] = []
     private var frameLayer: CALayer?
     private var frameDescriptor: SpriteDescriptor?
-    private var frameStarted = Date()
+    private var frameStarted: CFTimeInterval = 0
     private var frameGeneration = 0
     private var frameReady = false
     private var desiredFrameKey: String?
@@ -174,6 +174,39 @@ final class SpriteAssetPlayer {
     private(set) var isPlaying = false
     var debugLayerCount: Int { layers.count }
     var onReady: (() -> Void)?
+
+    // Leave enough time for the whole event, including its outro. One-shot
+    // movies use their media duration. Video loops stop at a whole loop.
+    static func playbackDuration(for asset: AssetRecord, target: TimeInterval, available: TimeInterval) -> TimeInterval? {
+        func length(_ sprite: SpriteDescriptor) -> TimeInterval? {
+            if sprite.mediaType == .frameSequence {
+                guard sprite.frameURL(sprite.startFrame) != nil,
+                      sprite.frameURL(sprite.endFrame) != nil else { return nil }
+                return sprite.frameDuration
+            }
+            return sprite.movieURL.flatMap(mediaDuration)
+        }
+        if let shot = asset.sprites.first(where: { $0.phase == .oneShot }) {
+            guard !shot.loops, let duration = length(shot), duration <= available else { return nil }
+            return duration
+        }
+        guard let intro = asset.sprites.first(where: { $0.phase == .intro }),
+              let loop = asset.sprites.first(where: { $0.phase == .loop }),
+              let outro = asset.sprites.first(where: { $0.phase == .outro }),
+              asset.sprites.allSatisfy({ $0.mediaType == loop.mediaType }),
+              let introLength = length(intro), let loopLength = length(loop), let outroLength = length(outro)
+        else { return nil }
+        let fixed = introLength + outroLength
+        guard fixed + loopLength <= available else { return nil }
+        let desired = max(loopLength, min(target, available) - fixed)
+        let count = min((desired / loopLength).rounded(), ((available - fixed) / loopLength).rounded(.down))
+        return fixed + max(1, count) * loopLength
+    }
+
+    private static func mediaDuration(_ url: URL) -> TimeInterval? {
+        let value = AVURLAsset(url: url).duration.seconds
+        return value.isFinite && value > 0 ? value : nil
+    }
 
     init(host: CALayer, sceneOffset: CGPoint, hostBounds: @escaping () -> CGRect) {
         self.host = host; self.sceneOffset = sceneOffset; self.hostBounds = hostBounds
@@ -205,9 +238,9 @@ final class SpriteAssetPlayer {
         }
     }
 
-    func tick(_ date: Date = Date()) {
+    func tick() {
         guard frameReady, let descriptor = frameDescriptor, let layer = frameLayer else { return }
-        let elapsed = Int(max(0, date.timeIntervalSince(frameStarted)) * 30)
+        let elapsed = Int(max(0, CACurrentMediaTime() - frameStarted) * SpriteDescriptor.framesPerSecond)
         let local = descriptor.loops ? elapsed % descriptor.frameCount : min(descriptor.frameCount - 1, elapsed)
         requestFrame(descriptor.startFrame + local, descriptor: descriptor, layer: layer, generation: frameGeneration)
         prefetch(descriptor, after: local, count: 6)
@@ -258,9 +291,9 @@ final class SpriteAssetPlayer {
         let intro = sprites.first { $0.phase == .intro }
         let loop = sprites.first { $0.phase == .loop }
         let outro = sprites.first { $0.phase == .outro }
-        let introDuration = intro.flatMap(\.movieURL).map(duration) ?? 0
-        let loopDuration = max(0.1, loop.flatMap(\.movieURL).map(duration) ?? 0.1)
-        let outroDuration = outro.flatMap(\.movieURL).map(duration) ?? 0
+        let introDuration = intro.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0
+        let loopDuration = loop.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0.1
+        let outroDuration = outro.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0
         let desiredLoop = max(loopDuration, targetDuration - introDuration - outroDuration)
         let loopCount = max(1, Int((desiredLoop / loopDuration).rounded()))
         var entries: [(SpriteDescriptor, URL)] = []
@@ -319,9 +352,9 @@ final class SpriteAssetPlayer {
         let layer = CALayer(); layer.contentsGravity = .resizeAspect
         layer.opacity = 0
         configure(layer, sprite: intro); frameLayer = layer
-        let introDuration = Double(intro.frameCount) / 30
-        let outroDuration = Double(outro.frameCount) / 30
-        let loopDuration = max(Double(loop.frameCount) / 30, targetDuration - introDuration - outroDuration)
+        let introDuration = intro.frameDuration
+        let outroDuration = outro.frameDuration
+        let loopDuration = max(loop.frameDuration, targetDuration - introDuration - outroDuration)
         activateFrame(intro, on: layer) { [weak self, weak layer] in
             guard let self, let layer, self.isPlaying else { return }
             self.schedule(introDuration) { [weak self, weak layer] in
@@ -361,7 +394,7 @@ final class SpriteAssetPlayer {
             activateFrame(descriptor, on: layer) { [weak self] in
                 guard let self, self.isPlaying else { return }
                 if !repeatWhole && !sprite.loops {
-                    self.schedule(Double(sprite.frameCount) / 30) { [weak self] in
+                    self.schedule(sprite.frameDuration) { [weak self] in
                         guard let self, self.isPlaying else { return }
                         self.isPlaying = false; completion?()
                     }
@@ -381,19 +414,26 @@ final class SpriteAssetPlayer {
                 } else { self.isPlaying = false; completion?() }
             })
             observeReady(item, player: player, layer: layer)
-        }
+        } else { isPlaying = false; completion?() }
     }
 
-    private func observeReady(_ item: AVPlayerItem, player: AVPlayer, layer: CALayer) {
-        observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self, weak player, weak layer] item, _ in
-            guard item.status == .readyToPlay, let self, let player, let layer, self.isPlaying else { return }
-            DispatchQueue.main.async {
-                player.preroll(atRate: 1) { [weak self, weak player, weak layer] _ in
-                    DispatchQueue.main.async {
-                        guard let self, let player, let layer, self.isPlaying else { return }
-                        self.reveal(layer); player.play()
-                    }
-                }
+    private func observeReady(_ item: AVPlayerItem, player: AVPlayer, layer: AVPlayerLayer) {
+        // Keep the outgoing sprite until the incoming layer can display a
+        // frame. Asset readiness alone can precede that point.
+        observations.append(layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self, weak player] layer, _ in
+            DispatchQueue.main.async { [weak self, weak player, weak layer] in
+                guard let self, let player, let layer, layer.isReadyForDisplay,
+                      self.isPlaying, self.players.contains(where: { $0 === player })
+                else { return }
+                self.reveal(layer)
+            }
+        })
+        observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self, weak player] item, _ in
+            DispatchQueue.main.async { [weak self, weak player] in
+                guard let self, let player, item.status == .readyToPlay,
+                      self.isPlaying, self.players.contains(where: { $0 === player })
+                else { return }
+                player.play()
             }
         })
     }
@@ -402,7 +442,9 @@ final class SpriteAssetPlayer {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         layer.opacity = 1
         CATransaction.commit()
-        onReady?(); onReady = nil
+        let didBecomeReady = onReady
+        onReady = nil
+        didBecomeReady?()
     }
     private func activateFrame(
         _ descriptor: SpriteDescriptor,
@@ -425,7 +467,7 @@ final class SpriteAssetPlayer {
         ) { [weak self, weak layer] in
             guard let self, let layer, self.isPlaying, self.frameGeneration == generation else { return }
             self.frameReady = true
-            self.frameStarted = Date()
+            self.frameStarted = CACurrentMediaTime()
             self.reveal(layer)
             completion?()
         }
@@ -528,10 +570,6 @@ final class SpriteAssetPlayer {
         layerDescriptors[ObjectIdentifier(layer)] = sprite
         if let video = layer as? AVPlayerLayer { video.videoGravity = .resizeAspect }
         host.addSublayer(layer); layers.append(layer)
-    }
-    private func duration(_ url: URL) -> TimeInterval {
-        let value = AVURLAsset(url: url).duration.seconds
-        return value.isFinite && value > 0 ? value : 3
     }
     private func schedule(_ delay: TimeInterval, _ block: @escaping () -> Void) {
         let item = DispatchWorkItem(block: block); workItems.append(item)
