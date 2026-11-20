@@ -5,7 +5,7 @@ import QuartzCore
 final class TransitionFrames {
     struct Phase {
         let mask: [CGImage]
-        let outline: [CGImage]
+        let outline: [SpriteRaster]
         var duration: TimeInterval { Double(mask.count) / TransitionSequence.framesPerSecond }
     }
 
@@ -20,7 +20,7 @@ final class TransitionFrames {
 
         init(_ pair: Pair) {
             self.pair = pair
-            cost = [pair.hide.mask, pair.hide.outline, pair.reveal.mask, pair.reveal.outline]
+            cost = [pair.hide.mask, pair.hide.outline.map(\.image), pair.reveal.mask, pair.reveal.outline.map(\.image)]
                 .joined().reduce(0) { $0 + $1.bytesPerRow * $1.height }
         }
     }
@@ -28,7 +28,7 @@ final class TransitionFrames {
     private static let cache: NSCache<NSString, CachedPair> = {
         let cache = NSCache<NSString, CachedPair>()
         cache.countLimit = 1
-        cache.totalCostLimit = 48 * 1024 * 1024
+        cache.totalCostLimit = 192 * 1024 * 1024
         return cache
     }()
 
@@ -48,12 +48,10 @@ final class TransitionFrames {
     init(choice: TransitionChoice, pixelWidth: CGFloat) {
         let hide = choice.hide
         let reveal = choice.reveal
-        // Reserve at most about 48 MiB of RGBA image pixels for a pair.
-        let frameCount = Double(2 * (hide.mask.frameCount + reveal.mask.frameCount))
-        let aspect = Double(hide.mask.assetSize.width / hide.mask.assetSize.height)
-        let boundedWidth = sqrt(48 * 1024 * 1024 * aspect / (4 * frameCount))
-        let pixelSize = Int(min(max(320, pixelWidth), min(768, boundedWidth)))
-        let key = [hide.mask.directoryURL.path, reveal.mask.directoryURL.path, String(pixelSize)]
+        // Give the visible ink a separate pixel budget. Thin strokes can be
+        // cropped without changing their position or their sampling density.
+        let outlineSize = Int(min(1536, max(512, pixelWidth)))
+        let key = [hide.mask.directoryURL.path, reveal.mask.directoryURL.path, String(outlineSize)]
             .joined(separator: "|") as NSString
         if let cached = Self.cache.object(forKey: key) {
             result = cached.pair
@@ -62,7 +60,7 @@ final class TransitionFrames {
         }
         operation.addExecutionBlock { [weak self, weak operation] in
             guard let operation else { return }
-            let result = Self.decodePair(hide: hide, reveal: reveal, pixelSize: pixelSize, operation: operation)
+            let result = Self.decodePair(hide: hide, reveal: reveal, pixelSize: outlineSize, operation: operation)
             guard !operation.isCancelled else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -97,13 +95,16 @@ final class TransitionFrames {
         _ sequence: TransitionSequence, pixelSize: Int, operation: Operation
     ) -> Phase? {
         var masks: [CGImage] = []
-        var outlines: [CGImage] = []
+        var outlines: [SpriteRaster] = []
         for frame in sequence.mask.startFrame...sequence.mask.endFrame {
             guard !operation.isCancelled,
                   let maskURL = sequence.mask.frameURL(frame),
                   let outlineURL = sequence.outline.frameURL(frame),
-                  let mask = autoreleasepool(invoking: { FrameDecoder.decodeImage(maskURL, maxPixelSize: pixelSize) }),
-                  let outline = autoreleasepool(invoking: { FrameDecoder.decodeImage(outlineURL, maxPixelSize: pixelSize) })
+                  let mask = autoreleasepool(invoking: { FrameDecoder.decodeImage(maskURL, maxPixelSize: min(640, pixelSize)) }),
+                  let outline = autoreleasepool(invoking: {
+                      FrameDecoder.decodeImage(outlineURL, maxPixelSize: pixelSize)
+                          .map(SpriteRaster.trimmingTransparentBorder)
+                  })
             else { return nil }
             masks.append(mask)
             outlines.append(outline)
@@ -132,44 +133,46 @@ final class TransitionFrames {
 final class TransitionAnimator {
     static let dissolveDuration: TimeInterval = 1.5
 
+    enum Direction: String {
+        case hide, reveal
+    }
+
     private let root: CALayer
     private let incoming: CALayer
     private let outgoing: CALayer?
-    private let backdrop: CGColor
     private let mask = CALayer()
     private let outline = CALayer()
-    private var previousBackground: CGColor?
+    private var outlineRaster: SpriteRaster?
     private var maskedLayer: CALayer?
     private var work: DispatchWorkItem?
     private var frameTimer: Timer?
     private var active = true
     private var started = false
 
-    init(root: CALayer, incoming: CALayer, outgoing: CALayer?, backdrop: CGColor) {
+    init(root: CALayer, incoming: CALayer, outgoing: CALayer?) {
         self.root = root
         self.incoming = incoming
         self.outgoing = outgoing
-        self.backdrop = backdrop
         mask.contentsGravity = .resizeAspectFill
-        outline.contentsGravity = .resizeAspectFill
+        outline.contentsGravity = .resize
         outline.zPosition = 100
     }
 
     func play(
         frames: TransitionFrames?,
-        onSpriteStart: @escaping () -> Void,
-        onCut: @escaping () -> Void,
+        direction: Direction,
+        onStart: @escaping (_ usesSprite: Bool) -> Void,
         completion: @escaping () -> Void
     ) {
         // Mirror the old dissolve for first presentation and incomplete assets.
         guard let frames, let outgoing else {
-            dissolve(onCut: onCut, completion: completion)
+            dissolve(onStart: onStart, completion: completion)
             return
         }
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.active, !self.started else { return }
             NSLog("Snoopy transition frames not ready; using dissolve")
-            self.dissolve(onCut: onCut, completion: completion)
+            self.dissolve(onStart: onStart, completion: completion)
         }
         work = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timeout)
@@ -178,35 +181,34 @@ final class TransitionAnimator {
             self.work?.cancel()
             guard let pair else {
                 NSLog("Snoopy transition frames missing or unreadable; using dissolve")
-                self.dissolve(onCut: onCut, completion: completion)
+                self.dissolve(onStart: onStart, completion: completion)
                 return
             }
             self.started = true
-            self.previousBackground = self.root.backgroundColor
+            let phase = direction == .hide ? pair.hide : pair.reveal
+            let top = direction == .hide ? outgoing : self.incoming
+            let bottom = direction == .hide ? self.incoming : outgoing
             CATransaction.begin(); CATransaction.setDisableActions(true)
-            self.root.backgroundColor = self.backdrop
+            // One scene is always fully visible under the animated mask.
+            // Hide closes the OLD scene over the new one; Reveal opens the
+            // NEW scene over the old one. Never chain two empty endpoints.
+            self.root.insertSublayer(top, above: bottom)
+            self.incoming.opacity = 1
+            outgoing.opacity = 1
             self.root.addSublayer(self.outline)
-            self.installMask(over: outgoing, phaseName: "hide")
+            self.showFrame(0, of: phase)
+            self.installMask(over: top, phaseName: direction.rawValue)
             CATransaction.commit()
-            onSpriteStart()
-            self.playPhase(pair.hide) { [weak self] in
-                guard let self else { return }
-                CATransaction.begin(); CATransaction.setDisableActions(true)
-                outgoing.opacity = 0
-                self.installMask(over: self.incoming, phaseName: "reveal")
-                self.incoming.opacity = 1
-                CATransaction.commit()
-                onCut()
-                self.playPhase(pair.reveal) { [weak self] in
-                    self?.complete(completion)
-                }
+            onStart(true)
+            self.playPhase(phase) { [weak self] in
+                self?.complete(completion)
             }
         }
     }
 
     func resize() {
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        outline.frame = root.bounds
+        layoutOutline()
         if let maskedLayer { mask.frame = maskedLayer.bounds }
         CATransaction.commit()
     }
@@ -217,15 +219,12 @@ final class TransitionAnimator {
         work?.cancel(); work = nil
         frameTimer?.invalidate(); frameTimer = nil
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        if outline.superlayer != nil {
-            root.backgroundColor = previousBackground
-            outline.removeFromSuperlayer()
-        }
+        outline.removeFromSuperlayer()
         maskedLayer?.mask = nil; maskedLayer = nil
         mask.removeAllAnimations(); mask.contents = nil
         outline.removeAllAnimations(); outline.contents = nil
+        outlineRaster = nil
         incoming.removeAnimation(forKey: "snoopyFadeIn")
-        outgoing?.removeAnimation(forKey: "snoopyFadeOut")
         CATransaction.commit()
     }
 
@@ -248,7 +247,6 @@ final class TransitionAnimator {
     private func playPhase(_ phase: TransitionFrames.Phase, completion: @escaping () -> Void) {
         let start = CACurrentMediaTime()
         var displayedFrame = 0
-        showFrame(0, of: phase)
         // Only submit the current pair to Core Animation. Uploading two
         // sequences as contents keyframes keeps their render surfaces alive.
         let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
@@ -272,32 +270,42 @@ final class TransitionAnimator {
     private func showFrame(_ frame: Int, of phase: TransitionFrames.Phase) {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         mask.contents = phase.mask[frame]
-        outline.contents = phase.outline[frame]
+        outlineRaster = phase.outline[frame]
+        outline.contents = outlineRaster?.image
+        layoutOutline()
         CATransaction.commit()
     }
 
-    private func dissolve(onCut: () -> Void, completion: @escaping () -> Void) {
+    private func layoutOutline() {
+        let bounds = root.bounds
+        let aspect = ViewportLayout.designSize.width / ViewportLayout.designSize.height
+        let width = max(bounds.width, bounds.height * aspect)
+        let height = width / aspect
+        let canvas = CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
+        outline.frame = outlineRaster?.frame(in: canvas) ?? canvas
+    }
+
+    private func dissolve(onStart: (Bool) -> Void, completion: @escaping () -> Void) {
         guard active, !started else { return }
         started = true
-        onCut()
         let fadeIn = CABasicAnimation(keyPath: "opacity")
         fadeIn.fromValue = 0; fadeIn.toValue = 1; fadeIn.duration = Self.dissolveDuration
         fadeIn.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        let fadeOut = CABasicAnimation(keyPath: "opacity")
-        fadeOut.fromValue = outgoing?.presentation()?.opacity ?? outgoing?.opacity ?? 1
-        fadeOut.toValue = 0; fadeOut.duration = Self.dissolveDuration
-        fadeOut.timingFunction = fadeIn.timingFunction
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        incoming.opacity = 1; outgoing?.opacity = 0
+        // Keep an opaque picture underneath the incoming fade. Fading both
+        // pictures exposes the black root at intermediate opacities.
+        incoming.opacity = 1; outgoing?.opacity = 1
         incoming.add(fadeIn, forKey: "snoopyFadeIn")
-        outgoing?.add(fadeOut, forKey: "snoopyFadeOut")
         CATransaction.commit()
+        onStart(false)
         schedule(after: Self.dissolveDuration) { [weak self] in self?.complete(completion) }
     }
 
     private func complete(_ completion: () -> Void) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
         cancel()
         completion()
+        CATransaction.commit()
     }
 
     private func schedule(after delay: TimeInterval, _ action: @escaping () -> Void) {

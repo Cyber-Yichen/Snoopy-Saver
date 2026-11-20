@@ -3,6 +3,7 @@ import QuartzCore
 
 final class IdleScenePlayback {
     let container = CALayer()
+    private static let defaultBackdrop = NSColor(calibratedRed: 0.86, green: 0.82, blue: 0.70, alpha: 1).cgColor
     let composition: IdleComposition
     let targetDuration: TimeInterval
     var onFinished: (() -> Void)?
@@ -17,9 +18,12 @@ final class IdleScenePlayback {
     private var permanent: [SpriteAssetPlayer] = []
     private var character: SpriteAssetPlayer?
     private var transitionCharacter: SpriteAssetPlayer?
-    private var transitionPoseVisible = false
     private var previousCharacter: SpriteAssetPlayer?
     private var basePoseReady = false
+    private var centerpieceReady = false
+    var onInitialFrameReady: (() -> Void)? {
+        didSet { signalInitialFrame() }
+    }
     private var visitor: SpriteAssetPlayer?
     private var weather: SpriteAssetPlayer?
     private var weatherEnds: CFTimeInterval?
@@ -57,8 +61,7 @@ final class IdleScenePlayback {
         currentPoseID = initialPoseID ?? composition.basePose.identifier
         container.frame = frame; container.masksToBounds = true
         background.frame = container.bounds
-        background.backgroundColor = composition.palette?.palette?.background.cgColor
-            ?? NSColor(calibratedRed: 0.86, green: 0.82, blue: 0.70, alpha: 1).cgColor
+        background.backgroundColor = composition.palette?.palette?.background.cgColor ?? Self.defaultBackdrop
         background.zPosition = 0; container.addSublayer(background)
         if let overlay = composition.palette?.palette?.overlay,
            let url = Bundle(for: SnoopyScreenSaverView.self).url(forResource: "halftone_pattern", withExtension: "png"),
@@ -78,6 +81,10 @@ final class IdleScenePlayback {
         guard !prepared else { return }
         prepared = true
         let scene = player(offset: composition.scene.sceneOffset)
+        scene.onReady = { [weak self] in
+            self?.centerpieceReady = true
+            self?.signalInitialFrame()
+        }
         scene.play(composition.scene); permanent.append(scene)
         startBasePose(replacing: nil)
     }
@@ -110,27 +117,30 @@ final class IdleScenePlayback {
         visitor?.tick(); weather?.tick()
     }
 
-    func playTransitionPose(_ pose: AssetRecord?) {
-        guard let pose else { return }
+    func prepareHidePose(_ pose: AssetRecord?) {
+        discardPreparedHidePose()
+        guard basePoseReady, let pose, pose.hideStartPoseID == currentPoseID else { return }
         let action = player(offset: composition.scene.sceneOffset)
-        transitionCharacter?.stop()
-        transitionPoseVisible = false
         transitionCharacter = action
-        action.onReady = { [weak self, weak action] in
-            guard let self, let action, self.transitionCharacter === action else { return }
-            self.transitionPoseVisible = true
-            self.character?.setHidden(true)
-            self.previousCharacter?.setHidden(true)
-        }
-        action.play(pose)
+        action.play(pose, holdFirstVideoFrame: true)
     }
 
-    func clearTransitionPose() {
+    func startPreparedHidePose() {
+        // Decide once at the start of the wipe. A late decode must never
+        // replace a character that the viewer has already seen in motion.
+        guard let transitionCharacter else { return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        if transitionCharacter.startPreparedVideo() {
+            character?.setHidden(true)
+        } else {
+            discardPreparedHidePose()
+        }
+        CATransaction.commit()
+    }
+
+    func discardPreparedHidePose() {
         transitionCharacter?.stop()
         transitionCharacter = nil
-        transitionPoseVisible = false
-        character?.setHidden(false)
-        previousCharacter?.setHidden(false)
     }
 
     func resize(_ frame: CGRect) {
@@ -140,13 +150,25 @@ final class IdleScenePlayback {
         visitor?.resize(); weather?.resize()
     }
     func stop() {
+        onInitialFrameReady = nil
         stopScheduling()
-        clearTransitionPose()
+        discardPreparedHidePose()
         permanent.forEach { $0.stop() }; character?.stop(); previousCharacter?.stop()
         weather?.stop()
         permanent.removeAll(); character = nil; previousCharacter = nil
         weather = nil; weatherEnds = nil
-        prepared = false
+        prepared = false; basePoseReady = false; centerpieceReady = false
+    }
+
+    func retire() {
+        stopScheduling()
+        if let previousCharacter {
+            // The replacement has not shown its first frame. Keep the
+            // displayed sprite instead of letting a late callback swap it.
+            character?.stop()
+            character = previousCharacter
+            self.previousCharacter = nil
+        }
     }
 
     func stopScheduling() {
@@ -169,10 +191,16 @@ final class IdleScenePlayback {
             guard let self, let next, self.character === next else { return }
             self.previousCharacter?.stop()
             self.previousCharacter = nil
-            next.setHidden(self.transitionPoseVisible)
             self.basePoseReady = true
+            self.signalInitialFrame()
         }
         next.play(base, repeatWhole: true)
+    }
+
+    private func signalInitialFrame() {
+        guard basePoseReady, centerpieceReady, let ready = onInitialFrameReady else { return }
+        onInitialFrameReady = nil
+        ready()
     }
 
     private func startWeather(now: CFTimeInterval) {
@@ -244,30 +272,34 @@ final class IdleScenePlayback {
         let kind = nextAnimationKind()
         var scheduledKind = kind
         var animation: AssetRecord?
+        var durations: [String: TimeInterval] = [:]
+        let compatibleWindow = weatherEnds.map { min(available, $0 - now - 2) } ?? available
+        let target = Double.random(in: 6...10)
+        func fits(_ candidate: AssetRecord, in window: TimeInterval) -> Bool {
+            guard let duration = SpriteAssetPlayer.playbackDuration(for: candidate, target: target, available: window)
+            else { return false }
+            durations[candidate.identifier] = duration
+            return true
+        }
         if kind != .characterBasePose || effect != nil {
             let specialKind = kind == .characterBasePose ? .characterAdditionalPose : kind
             animation = catalog.selectCharacterAnimation(
                 from: currentPoseID, kind: specialKind, scene: composition.scene,
                 environment: snapshot, dependencyEnvironment: dependency, scorer: scorer,
-                eligible: { asset in dependency.isEmpty || asset.relevancy.dependencies.contains {
-                    clause in dependency.contains { $0.category == clause.category && $0.facts.intersects(clause.facts) }
-                } }
+                eligible: { asset in
+                    let matchesWeather = dependency.isEmpty || asset.relevancy.dependencies.contains { clause in
+                        dependency.contains { $0.category == clause.category && $0.facts.intersects(clause.facts) }
+                    }
+                    return matchesWeather && fits(asset, in: compatibleWindow)
+                }
             )
             scheduledKind = specialKind
         }
-        let compatibleWindow = weatherEnds.map { min(available, $0 - now - 2) } ?? available
-        let target = Double.random(in: 6...10)
-        var duration = animation.flatMap {
-            SpriteAssetPlayer.playbackDuration(for: $0, target: target, available: compatibleWindow)
-        }
-        if duration == nil, effect == nil {
-            animation = catalog.selectPoseTransition(from: currentPoseID)
-            duration = animation.flatMap {
-                SpriteAssetPlayer.playbackDuration(for: $0, target: target, available: available)
-            }
+        if animation == nil, effect == nil {
+            animation = catalog.selectPoseTransition(from: currentPoseID) { fits($0, in: available) }
             scheduledKind = .characterBasePose
         }
-        guard let animation, let duration else { nextCharacterAt = now + 2; return }
+        guard let animation, let duration = durations[animation.identifier] else { nextCharacterAt = now + 2; return }
 
         let next = player(offset: composition.scene.sceneOffset)
         previousCharacter = character
@@ -307,9 +339,15 @@ final class IdleScenePlayback {
     }
 
     private func beginVisitor(at now: CFTimeInterval, available: TimeInterval) {
+        let target = Double.random(in: 5...9)
+        var selectedDuration: TimeInterval?
         guard let asset = catalog.selectVisitor(
-            scene: composition.scene, environment: environment.snapshot(), dependencyEnvironment: [], scorer: scorer
-        ), let duration = SpriteAssetPlayer.playbackDuration(for: asset, target: Double.random(in: 5...9), available: available)
+            scene: composition.scene, environment: environment.snapshot(), dependencyEnvironment: [], scorer: scorer,
+            eligible: { candidate in
+                selectedDuration = SpriteAssetPlayer.playbackDuration(for: candidate, target: target, available: available)
+                return selectedDuration != nil
+            }
+        ), let duration = selectedDuration
         else { return }
         let p = player(offset: asset.ignoresSceneOffset ? .zero : composition.scene.sceneOffset)
         visitor = p

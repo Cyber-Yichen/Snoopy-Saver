@@ -52,21 +52,83 @@ struct RuntimeSmoke {
             window.contentView = nil
             window.close()
         }
+        let environment = ProcessInfo.processInfo.environment
         var peakResidentBytes = residentBytes()
         var presentedVideoSizes: Set<String> = []
         var maskFrames: [String: Set<ObjectIdentifier>] = [:]
         var outlineFrames: [String: Set<ObjectIdentifier>] = [:]
+        var lowestOutlineDensity = Double.infinity
+        var lowestPoseDensity = Double.infinity
+        var earlyVideoReveal = false
+        var uncoveredTransition = false
+        var observedContinuousReveal = false
+        var changedRevealCharacter = false
+        var invalidHideHandoff = false
+        var revealingScene: CALayer?
+        var revealedBase: ObjectIdentifier?
+        var phasesInCurrentSwitch: Set<String> = []
+        var transitionCaptures: [String: Process] = [:]
         let samplePlayback = {
             peakResidentBytes = max(peakResidentBytes, residentBytes())
             let layers = rootLayers(of: view)
             let outlineLayer = layers.first { $0.name?.hasPrefix("snoopyTransitionOutline.") == true }
-            for scene in layers {
+            if let tracked = revealingScene, !layers.contains(where: { $0 === tracked }) {
+                revealingScene = nil
+                revealedBase = nil
+            }
+            for (index, scene) in layers.enumerated() {
+                let sprites = scene.sublayers ?? []
+                let visibleBase = sprites.first { $0.name == "snoopyIdleBasePose" && !$0.isHidden && $0.opacity == 1 }
+                if scene === revealingScene, outlineLayer == nil {
+                    if let revealedBase {
+                        let continues = visibleBase.map(ObjectIdentifier.init) == revealedBase
+                        observedContinuousReveal = observedContinuousReveal || continues
+                        changedRevealCharacter = changedRevealCharacter || !continues
+                    }
+                    revealingScene = nil
+                    revealedBase = nil
+                }
                 if let name = outlineLayer?.name,
                    let outline = outlineLayer?.contents, let mask = scene.mask?.contents {
+                    if name.hasSuffix(".reveal") {
+                        if scene !== revealingScene {
+                            revealingScene = scene
+                            revealedBase = nil
+                        }
+                        let visibleID = visibleBase.map(ObjectIdentifier.init)
+                        if let revealedBase {
+                            changedRevealCharacter = changedRevealCharacter || visibleID != revealedBase
+                        } else {
+                            revealedBase = visibleID
+                        }
+                    } else if let action = sprites.first(where: { $0.name == "snoopyHideCharacter" }) as? AVPlayerLayer {
+                        invalidHideHandoff = invalidHideHandoff || visibleBase != nil || !action.isReadyForDisplay
+                    }
+                    phasesInCurrentSwitch.insert(name)
                     maskFrames[name, default: []].insert(ObjectIdentifier(mask as AnyObject))
                     outlineFrames[name, default: []].insert(ObjectIdentifier(outline as AnyObject))
+                    if let outlineLayer, outlineLayer.frame.width > 0 {
+                        let image = outline as! CGImage
+                        lowestOutlineDensity = min(lowestOutlineDensity, Double(CGFloat(image.width) / outlineLayer.frame.width))
+                    }
+                    let underlay = layers[..<index].last
+                    let video = underlay?.sublayers?.compactMap { $0 as? AVPlayerLayer }.first
+                    uncoveredTransition = uncoveredTransition
+                        || underlay?.opacity != 1 || underlay?.mask != nil || underlay?.frame != scene.frame
+                    earlyVideoReveal = earlyVideoReveal || video?.isReadyForDisplay != true
+                    if transitionCaptures[name] == nil, (maskFrames[name]?.count ?? 0) >= 12,
+                       let prefix = environment["SNOOPY_RUNTIME_TRANSITION_SCREENSHOTS"] {
+                        let process = Process()
+                        process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                        process.arguments = ["-x", "-l", String(window.windowNumber), "\(prefix)-\(name).png"]
+                        if (try? process.run()) != nil { transitionCaptures[name] = process }
+                    }
                 }
                 for layer in scene.sublayers ?? [] {
+                    if layer.name == "snoopyIdleBasePose", let contents = layer.contents, layer.frame.width > 0 {
+                        let image = contents as! CGImage
+                        lowestPoseDensity = min(lowestPoseDensity, Double(CGFloat(image.width) / layer.frame.width))
+                    }
                     guard let video = layer as? AVPlayerLayer, video.videoGravity == .resizeAspectFill,
                           video.isReadyForDisplay,
                           let size = video.player?.currentItem?.presentationSize else { continue }
@@ -81,7 +143,6 @@ struct RuntimeSmoke {
             "screen saver did not create an initial scene layer"
         )
 
-        let environment = ProcessInfo.processInfo.environment
         if let idleSeconds = Double(environment["SNOOPY_RUNTIME_IDLE_SECONDS"] ?? ""), idleSeconds > 0 {
             let activity = NSSelectorFromString("idleActivityForTesting")
             try require(view.responds(to: activity), "missing IdleScene activity probe")
@@ -111,7 +172,13 @@ struct RuntimeSmoke {
             try require(!overlap, "visitor overlapped a character event or transition pose")
             try require(observedCharacter, "no IdleScene character event ran")
             try require(observedVisitor, "no IdleScene visitor ran")
-            if let capture { capture.waitUntilExit() }
+            if environment["SNOOPY_RUNTIME_SCREENSHOT"] != nil {
+                try require(capture != nil, "IdleScene screenshot was requested but no capture started")
+            }
+            if let capture {
+                capture.waitUntilExit()
+                try require(capture.terminationStatus == 0, "IdleScene screenshot capture failed")
+            }
             print("IdleScene pacing: character and visitor events observed with no overlap.")
         }
         let switchCount = Int(environment["SNOOPY_RUNTIME_SWITCHES"] ?? "") ?? 8
@@ -123,8 +190,28 @@ struct RuntimeSmoke {
             guard view.responds(to: selector) else {
                 throw RuntimeFailure.failed("missing runtime test selector")
             }
-            view.perform(selector)
+            phasesInCurrentSwitch.removeAll()
+            if index == 1 {
+                // Superseding a pending Idle scene must not promote it
+                // to visible or discard the movie that is still showing.
+                guard let outgoing = rootLayers(of: view).first(where: { layer in
+                    layer.opacity == 1 && (layer.sublayers ?? []).contains { sublayer in
+                        (sublayer as? AVPlayerLayer)?.videoGravity == .resizeAspectFill
+                    }
+                }) else { throw RuntimeFailure.failed("missing visible movie before pre-reveal interruption") }
+                view.perform(selector)
+                let pending = rootLayers(of: view).first { $0 !== outgoing && $0.opacity == 0 }
+                try require(pending != nil, "incoming Idle was visible before its initial-frame handoff")
+                view.perform(selector)
+                let after = rootLayers(of: view)
+                try require(after.contains { $0 === outgoing } && !after.contains { $0 === pending },
+                            "superseding a hidden Idle discarded the currently visible movie")
+            } else {
+                view.perform(selector)
+            }
             spin(seconds: dwell, sample: samplePlayback)
+            let expected = index.isMultiple(of: 2) ? "snoopyTransitionOutline.hide" : "snoopyTransitionOutline.reveal"
+            try require(phasesInCurrentSwitch.isSubset(of: [expected]), "one scene switch ran multiple or wrong-direction wipes")
             let layers = rootLayers(of: view).count
             try require(layers <= 3, "root layer count accumulated to \(layers)")
             print(
@@ -153,12 +240,22 @@ struct RuntimeSmoke {
             "interrupted transitions did not settle to one scene: \(remainingDescriptions)"
         )
         try require(!presentedVideoSizes.isEmpty, "no AVPlayerLayer reported a video frame ready for display")
+        try require(!uncoveredTransition, "a wipe exposed the root instead of an unmasked, opaque scene underneath")
+        try require(!earlyVideoReveal, "transition revealed a video layer before it had a displayable frame")
+        try require(observedContinuousReveal && !changedRevealCharacter, "Reveal did not keep the same base sprite through the wipe")
+        try require(!invalidHideHandoff, "Hide showed an unprepared action or two character sprites")
+        try require(lowestOutlineDensity.isFinite && lowestOutlineDensity >= 0.8, "transition outline raster is too small")
+        try require(lowestPoseDensity.isFinite && lowestPoseDensity >= 0.9, "base-pose raster is too small")
         for phase in ["hide", "reveal"] {
             let name = "snoopyTransitionOutline.\(phase)"
             try require(
                 (maskFrames[name]?.count ?? 0) > 1 && (outlineFrames[name]?.count ?? 0) > 1,
                 "mask and outline did not both advance during \(phase)"
             )
+        }
+        for capture in transitionCaptures.values {
+            capture.waitUntilExit()
+            try require(capture.terminationStatus == 0, "transition screenshot capture failed")
         }
 
         view.stopAnimation()
@@ -177,7 +274,8 @@ struct RuntimeSmoke {
         print(
             "Runtime smoke passed: \(switchCount) normal and \(interruptedSwitches) interrupted scene changes, "
                 + "peakRSS=\(peakResidentBytes / 1_048_576)MiB, clean shutdown, "
-                + "animated mask and outline in both phases, video sizes=\(presentedVideoSizes.sorted().joined(separator: ", "))"
+                + String(format: "outline=%.2f px/pt, base pose=%.2f px/pt, ", lowestOutlineDensity, lowestPoseDensity)
+                + "one wipe per switch with full scene coverage, video sizes=\(presentedVideoSizes.sorted().joined(separator: ", "))"
         )
     }
 

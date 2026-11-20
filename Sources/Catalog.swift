@@ -78,14 +78,17 @@ final class RelevancyEngine {
         _ assets: [AssetRecord],
         kind: String,
         environment: EnvironmentSnapshot,
-        dependencyEnvironment: [RelevancyClause] = []
+        dependencyEnvironment: [RelevancyClause] = [],
+        eligible: (AssetRecord) -> Bool = { _ in true }
     ) -> AssetRecord? {
-        let scored = assets.compactMap { asset in
+        var scored = assets.compactMap { asset in
             score(asset, kind: kind, environment: environment, dependencyEnvironment: dependencyEnvironment)
                 .map { (asset, $0) }
         }
-        if let maximum = scored.map(\.1).max() {
-            return scored.filter { abs($0.1 - maximum) < 0.000_001 }.randomElement()?.0
+        while let maximum = scored.map(\.1).max() {
+            let tied = scored.filter { abs($0.1 - maximum) < 0.000_001 }.shuffled()
+            if let winner = tied.first(where: { eligible($0.0) }) { return winner.0 }
+            scored.removeAll { abs($0.1 - maximum) < 0.000_001 }
         }
         // Generic candidates already participate in scoring. A second pass
         // based on info alone would bypass dependencies and exclusions.
@@ -125,7 +128,9 @@ final class AssetCatalog {
             guard directory.pathExtension == "icasset" else { continue }
             enumerator?.skipDescendants()
             guard let record = Self.parse(directory) else { continue }
-            if record.kind == .activeScene, record.activeMovieURL == nil { continue }
+            // A higher-priority pack with metadata but incomplete media
+            // must not displace a renderable copy from the default pack.
+            guard Self.hasRenderableMedia(record) else { continue }
             let key = "\(record.kind.rawValue)/\(record.identifier)"
             if let old = preferred[key], old.sourcePriority >= record.sourcePriority { continue }
             preferred[key] = record
@@ -137,6 +142,24 @@ final class AssetCatalog {
     }
 
     func assets(_ kind: AssetKind) -> [AssetRecord] { byKind[kind] ?? [] }
+
+    private static func hasRenderableMedia(_ record: AssetRecord) -> Bool {
+        switch record.kind {
+        case .activeScene, .characterSceneTransitionPose:
+            return record.activeMovieURL != nil
+        case .idleScene, .characterBasePose, .characterAdditionalPose, .characterMoment,
+             .characterPoseTransition, .idleSceneVisitor, .spriteTransitionParameters:
+            return !record.sprites.isEmpty && record.sprites.allSatisfy {
+                switch $0.mediaType {
+                case .video: return $0.movieURL != nil
+                case .frameSequence:
+                    let sprite = $0
+                    return (sprite.startFrame...sprite.endFrame).allSatisfy { sprite.frameURL($0) != nil }
+                }
+            }
+        default: return true
+        }
+    }
 
     func selectActive(environment: EnvironmentSnapshot, scorer: RelevancyEngine) -> AssetRecord? {
         let playable = assets(.activeScene).filter { $0.activeMovieURL != nil }
@@ -220,22 +243,25 @@ final class AssetCatalog {
         return result
     }
 
-    func selectPoseTransition(from poseID: String) -> AssetRecord? {
-        assets(.characterPoseTransition).filter { $0.startPoseID == poseID && $0.endPoseID != poseID }.randomElement()
+    func selectPoseTransition(from poseID: String, eligible: (AssetRecord) -> Bool = { _ in true }) -> AssetRecord? {
+        assets(.characterPoseTransition).filter {
+            $0.startPoseID == poseID && $0.endPoseID != poseID && eligible($0)
+        }.randomElement()
     }
 
     func selectVisitor(
         scene: AssetRecord,
         environment: EnvironmentSnapshot,
         dependencyEnvironment: [RelevancyClause],
-        scorer: RelevancyEngine
+        scorer: RelevancyEngine,
+        eligible: (AssetRecord) -> Bool = { _ in true }
     ) -> AssetRecord? {
         let candidates = assets(.idleSceneVisitor).filter {
             !$0.isFullscreenEffect && !scene.excludedVisitors.contains($0.identifier)
         }
         guard let result = scorer.choose(
             candidates, kind: "visitor", environment: environment,
-            dependencyEnvironment: dependencyEnvironment
+            dependencyEnvironment: dependencyEnvironment, eligible: eligible
         ) else { return nil }
         return result
     }
@@ -361,24 +387,37 @@ final class AssetCatalog {
 
     private static func parseSprites(_ content: [String: Any], directory: URL) -> [SpriteDescriptor] {
         var result: [SpriteDescriptor] = []
+        func boundedInteger(_ value: Any?, default fallback: Int, in range: ClosedRange<Int>) -> Int? {
+            guard let value else { return fallback }
+            guard let number = value as? NSNumber else { return nil }
+            let raw = number.doubleValue
+            guard raw.isFinite, raw.rounded(.towardZero) == raw,
+                  raw >= Double(range.lowerBound), raw <= Double(range.upperBound) else { return nil }
+            return Int(raw)
+        }
         func append(_ value: Any?, phase: SpritePhase) {
             guard let sprites = (value as? [String: Any])?["sprites"] as? [[String: Any]] else { return }
             for sprite in sprites {
                 guard let atlas = sprite["atlas"] as? [String: Any],
-                      let base = atlas["assetBaseName"] as? String,
+                      let base = atlas["assetBaseName"] as? String, !base.isEmpty, !base.contains("/"),
                       let rawType = sprite["spriteType"] as? String,
                       let type = SpriteMediaType(rawValue: rawType) else { continue }
                 let timing = sprite["customTiming"] as? [String: Any] ?? [:]
+                guard let start = boundedInteger(timing["start"], default: 0, in: 0...999_999),
+                      let end = boundedInteger(timing["end"], default: 0, in: start...999_999),
+                      let digits = boundedInteger(atlas["frameIndexDigitCount"], default: 2, in: 1...9),
+                      start <= end else { continue }
                 let size = atlas["assetSize"] as? [NSNumber] ?? []
+                let width = size.first?.doubleValue ?? 1920, height = size.dropFirst().first?.doubleValue ?? 1080
+                guard (1...16_384).contains(width), (1...16_384).contains(height) else { continue }
                 let placement = (sprite["placement"] as? [String: Any])?["anchored"] as? [String: Any]
                 result.append(SpriteDescriptor(
                     baseName: base, directoryURL: directory, mediaType: type, phase: phase,
-                    assetSize: CGSize(width: size.first?.doubleValue ?? 1920, height: size.dropFirst().first?.doubleValue ?? 1080),
+                    assetSize: CGSize(width: width, height: height),
                     alignment: placement?["alignment"] as? String ?? "center",
                     plane: sprite["plane"] as? String ?? "centerpiece",
                     loops: sprite["endBehavior"] as? String == "loop",
-                    startFrame: Int(number(timing["start"])), endFrame: Int(number(timing["end"])),
-                    digitCount: (atlas["frameIndexDigitCount"] as? NSNumber)?.intValue ?? 2
+                    startFrame: start, endFrame: end, digitCount: digits
                 ))
             }
         }
@@ -433,7 +472,10 @@ final class AssetCatalog {
         return NSColor(calibratedRed: number(d["red"]) / 255, green: number(d["green"]) / 255,
                        blue: number(d["blue"]) / 255, alpha: number(d["alpha"]))
     }
-    private static func number(_ value: Any?) -> CGFloat { CGFloat((value as? NSNumber)?.doubleValue ?? 0) }
+    private static func number(_ value: Any?) -> CGFloat {
+        let raw = (value as? NSNumber)?.doubleValue ?? 0
+        return (-16_384...16_384).contains(raw) ? CGFloat(raw) : 0
+    }
 }
 
 enum CatalogError: Error { case missingResources, missingAssets, noScenes }

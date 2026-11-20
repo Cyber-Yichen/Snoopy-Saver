@@ -107,6 +107,17 @@ struct AssetRecord {
         sprites.lazy.filter { $0.mediaType == .video }.compactMap(\.movieURL).first
     }
 
+    var hideStartPoseID: String? {
+        guard kind == .characterSceneTransitionPose, transitionPhase == "hide" else { return nil }
+        // Known endpoints from decoded bundled frames. The other Hide
+        // clips start outside the frame or with a different character pose.
+        if let startPoseID { return startPoseID }
+        switch identifier {
+        case "104_ST006_Hide_A", "104_ST006_Hide_B": return "101_BP001"
+        default: return nil
+        }
+    }
+
     let identifier: String
     let kind: AssetKind
     let directoryURL: URL

@@ -10,12 +10,12 @@
 [简体中文](README.md) · **English**
 
 > [!IMPORTANT]
-> **Latest release: Snoopy 1.1 (V1.1.0) · July 21, 2026**
+> **Latest release: Snoopy 2.0 (V2.0.0)**
 >
-> Version 1.1 focuses on long-running efficiency: it fixes elevated energy use, fan activity, and IdleScene frame drops; restructures the lifecycle of players, layers, HEIC decoding caches, and background work; and adds a new System Settings thumbnail.
+> Version 2.0 fixes black frames, duplicate wipes, and occasional pose jumps between ActiveScene and IdleScene. It also improves IdleScene pacing and sharpness.
 >
-> - [GitHub Release: split download and full release notes](https://github.com/Cyber-Yichen/Snoopy-Saver/releases/tag/V1.1.0)—download the installer ZIP and all four DMG parts, place them in one folder, then run the installer.
-> - [Baidu Netdisk: complete archive](https://pan.baidu.com/s/17pI0PTYSRbr7G-a06zrEBg?pwd=f2vm)—file `SnoopyScreenSaver 1.1zip.zip`, extraction code `f2vm`.
+> - [Direct download (ZIP, 7.93 GB)](https://mif.de5.net/SnoopyScreenSaver-2.0.zip)—unzip, then double-click `SnoopyScreenSaver.saver` to install it.
+> - [GitHub Release: split download and full release notes](https://github.com/Cyber-Yichen/Snoopy-Saver/releases/tag/V2.0.0)—download the installer ZIP and all four DMG parts. Extract the installer and run it beside all four parts.
 
 Snoopy Saver aims to bring the Snoopy screen saver from tvOS to macOS as completely as possible. It preserves the full-screen animated stories while rebuilding the layered scenes made from backgrounds, characters, visitors, weather effects, and palettes. The next scene is selected using date, time, weather, and recent play history.
 
@@ -109,6 +109,8 @@ This repository does not provide assets, downloaders, decryption tools, or asset
 ```bash
 Scripts/build_saver.sh --code-only
 ```
+
+`--code-only` produces `SnoopyScreenSaver-CodeOnly.saver` for compilation checks. Installation requires the full `SnoopyScreenSaver.saver` bundle.
 
 Every local media path is excluded by `.gitignore`.
 

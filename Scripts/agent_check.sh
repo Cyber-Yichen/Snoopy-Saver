@@ -9,13 +9,14 @@ cd "$ROOT"
 "$ROOT/Scripts/agent_preflight.sh" change
 
 quick_gate() {
-  local bundle="$BUILD_ROOT/SnoopyScreenSaver.saver"
+  local bundle="$BUILD_ROOT/SnoopyScreenSaver-CodeOnly.saver"
   SNOOPY_BUILD_DIR="$BUILD_ROOT" "$ROOT/Scripts/build_saver.sh" --code-only
   local architecture
   for architecture in arm64 x86_64; do
     xcrun lipo "$bundle/Contents/MacOS/SnoopyScreenSaver" -verify_arch "$architecture"
   done
   codesign --verify --deep --strict "$bundle"
+  test ! -e "$bundle/Contents/Resources/Assets"
   bash -n "$ROOT/Scripts/install_saver.sh"
   "$ROOT/Scripts/run_installer_smoke.sh" "$bundle"
   xcrun swiftc -swift-version 5 -parse-as-library -module-cache-path "$ROOT/.build/ModuleCache" \
@@ -37,6 +38,7 @@ case "$MODE" in
   runtime)
     test -n "${2:-}"
     quick_gate
+    SNOOPY_DISABLE_ENVIRONMENT_IO=1 "$BUILD_ROOT/frame-decoder-smoke" "$2/Contents/Resources"
     "$ROOT/Scripts/run_runtime_smoke.sh" "$2"
     ;;
   *)

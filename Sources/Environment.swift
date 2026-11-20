@@ -96,7 +96,7 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
             manager.delegate = self
             manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
         }
-        if let data = UserDefaults.standard.data(forKey: "SnoopyWeatherCache.v3") {
+        if locationIOEnabled, let data = UserDefaults.standard.data(forKey: "SnoopyWeatherCache.v3") {
             cache = try? JSONDecoder().decode(WeatherCache.self, from: data)
         }
     }
@@ -115,15 +115,28 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
         else { refreshIfNeeded() }
     }
     func refreshIfNeeded() {
+        let now = Date()
         guard running, locationIOEnabled, requestID == nil, manager.authorizationStatus != .notDetermined,
-              Date().timeIntervalSince(cache?.fetchedAt ?? .distantPast) > 30 * 60,
-              Date().timeIntervalSince(lastAttempt) > 5 * 60 else { return }
-        lastAttempt = Date()
+              Self.shouldRefresh(at: now, fetchedAt: cache?.fetchedAt, lastAttempt: lastAttempt) else { return }
+        lastAttempt = now
         if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways {
             manager.requestLocation()
         } else { fetch(fallbackLocation()) }
     }
+
+    static func shouldRefresh(at now: Date, fetchedAt: Date?, lastAttempt: Date) -> Bool {
+        let fetchedAge = now.timeIntervalSince(fetchedAt ?? .distantPast)
+        let retryAge = now.timeIntervalSince(lastAttempt)
+        // A wall-clock correction can put persisted timestamps in the future.
+        // They are not fresh and must not block a retry until the clock catches up.
+        return !(0..<30 * 60).contains(fetchedAge) && !(0..<5 * 60).contains(retryAge)
+    }
     func snapshot(at date: Date = Date()) -> EnvironmentSnapshot {
+        Self.snapshot(at: date, cachedWeather: cache)
+    }
+
+    static func snapshot(at date: Date, cachedWeather: WeatherCache?) -> EnvironmentSnapshot {
+        let cache = cachedWeather.flatMap { $0.isFresh(at: date) ? $0 : nil }
         var facts = RelevancyFacts()
         facts.events = EventCalendar.activeEvents(on: date)
         facts.timeBands = [TimeBand.current(date).rawValue]
@@ -220,7 +233,18 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     }
 }
 
-private struct WeatherCache: Codable { let fetchedAt: Date; let current, previous: String; let sunrise, sunset: Date? }
+struct WeatherCache: Codable {
+    let fetchedAt: Date
+    let current, previous: String
+    let sunrise, sunset: Date?
+
+    // Keep recent weather through short outages. After two hours, continue
+    // matching scenes by calendar, routine, time of day, and lunar phase.
+    func isFresh(at date: Date) -> Bool {
+        let age = date.timeIntervalSince(fetchedAt)
+        return age >= 0 && age < 2 * 60 * 60
+    }
+}
 private struct WeatherResponse: Decodable {
     struct Current: Decodable { let weatherCode, isDay: Int; let temperature, windSpeed: Double
         enum CodingKeys: String, CodingKey { case weatherCode="weather_code", isDay="is_day", temperature="temperature_2m", windSpeed="wind_speed_10m" } }

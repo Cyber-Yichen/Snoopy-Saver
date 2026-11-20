@@ -6,14 +6,18 @@ TOOLCHAIN="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xc
 SWIFT_LIB="$TOOLCHAIN/usr/lib/swift/macosx"
 BUILD="${SNOOPY_BUILD_DIR:-$ROOT/.build/SnoopyScreenSaver}"
 MODULE_CACHE="$ROOT/.build/ModuleCache"
-DESTINATION="$BUILD/SnoopyScreenSaver.saver"
 if [[ "${1:-}" != "--locked" ]]; then
   mkdir -p "$BUILD"
   exec /usr/bin/lockf -k "$BUILD/.snoopy-build.lock" /bin/bash "$0" --locked "$@"
 fi
 shift
 WITH_ASSETS=1
-[[ "${1:-}" == "--code-only" ]] && WITH_ASSETS=0
+BUNDLE_NAME="SnoopyScreenSaver.saver"
+if [[ "${1:-}" == "--code-only" ]]; then
+  WITH_ASSETS=0
+  BUNDLE_NAME="SnoopyScreenSaver-CodeOnly.saver"
+fi
+DESTINATION="$BUILD/$BUNDLE_NAME"
 STAGING="$(mktemp -d "$BUILD/.snoopy-build.XXXXXXXX")"
 BACKUP="$STAGING/previous.saver"
 cleanup() {
@@ -27,7 +31,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-BUNDLE="$STAGING/SnoopyScreenSaver.saver"
+BUNDLE="$STAGING/$BUNDLE_NAME"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources" "$MODULE_CACHE"
 for ARCH in arm64 x86_64; do
   mkdir -p "$STAGING/$ARCH"
@@ -52,9 +56,6 @@ if [[ "$WITH_ASSETS" -eq 1 ]]; then
     for PACKAGE in "$ROOT"/LocalAssets/OptionalDownloads/expanded/*; do
       cp -cR "$PACKAGE" "$BUNDLE/Contents/Resources/Assets/Optional/"
     done
-  fi
-  if [[ -f "$ROOT/LocalAssets/optional-assets.json" ]]; then
-    cp "$ROOT/LocalAssets/optional-assets.json" "$BUNDLE/Contents/Resources/optional-assets.json"
   fi
   cp "$ROOT/LocalAssets/FrameworkResources/halftone_pattern.png" "$BUNDLE/Contents/Resources/halftone_pattern.png"
 fi

@@ -10,12 +10,12 @@
 **简体中文** · [English](README_EN.md)
 
 > [!IMPORTANT]
-> **最新版本：Snoopy 1.1（V1.1.0）· 2026-07-21**
+> **最新版本：Snoopy 2.0（V2.0.0）**
 >
-> 1.1 重点修复了长时间运行后的高功耗、风扇升速和 IdleScene 掉帧，并重构播放器、图层、HEIC 解码缓存与后台任务的生命周期，同时更新了系统设置中的封面缩略图。
+> 2.0 修复了 ActiveScene 与 IdleScene 切换时的黑屏、重复转场和偶发姿势跳变，并改进了待机场景的动画节奏与清晰度。
 >
-> - [GitHub Release：分卷下载与完整更新说明](https://github.com/Cyber-Yichen/Snoopy-Saver/releases/tag/V1.1.0)——下载安装器 ZIP 和 4 个 DMG 分卷，全部放在同一目录后运行安装器。
-> - [百度网盘：完整压缩包](https://pan.baidu.com/s/17pI0PTYSRbr7G-a06zrEBg?pwd=f2vm)——文件 `SnoopyScreenSaver 1.1zip.zip`，提取码 `f2vm`。
+> - [整包直链（ZIP，7.93 GB）](https://mif.de5.net/SnoopyScreenSaver-2.0.zip)——解压后双击 `SnoopyScreenSaver.saver` 安装。
+> - [GitHub Release：分卷下载与完整更新说明](https://github.com/Cyber-Yichen/Snoopy-Saver/releases/tag/V2.0.0)——下载安装器 ZIP 和 4 个 DMG 分卷，将解压后的安装器与分卷放在同一目录后运行。
 
 Snoopy Saver 的核心目标，是把 tvOS 中的史努比屏幕保护程序尽可能完整地移植到 macOS：保留全屏动画，也重建由背景、角色、访客、天气效果和调色板共同组成的多图层场景，并按照日期、时间、天气和近期播放记录选择下一段内容。
 
@@ -109,6 +109,8 @@ Scripts/build_saver.sh
 ```bash
 Scripts/build_saver.sh --code-only
 ```
+
+`--code-only` 生成 `SnoopyScreenSaver-CodeOnly.saver`，仅用于编译验证。安装需要完整的 `SnoopyScreenSaver.saver`。
 
 所有本地媒体路径都被 `.gitignore` 排除。
 

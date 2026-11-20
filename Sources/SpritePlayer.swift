@@ -3,6 +3,58 @@ import AVFoundation
 import ImageIO
 import QuartzCore
 
+struct SpriteRaster {
+    let image: CGImage
+    // Crop in a lower-left-origin, unit-sized source canvas.
+    var region = CGRect(x: 0, y: 0, width: 1, height: 1)
+
+    func frame(in canvas: CGRect) -> CGRect {
+        CGRect(x: canvas.minX + canvas.width * region.minX,
+               y: canvas.minY + canvas.height * region.minY,
+               width: canvas.width * region.width, height: canvas.height * region.height)
+    }
+
+    static func trimmingTransparentBorder(_ image: CGImage) -> SpriteRaster {
+        let step = 8
+        let width = max(1, (image.width + step - 1) / step)
+        let height = max(1, (image.height + step - 1) / step)
+        guard let probe = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                    bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return SpriteRaster(image: image) }
+        probe.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let bytes = probe.data?.assumingMemoryBound(to: UInt8.self) else { return SpriteRaster(image: image) }
+        var left = width, right = 0, top = height, bottom = 0
+        for y in 0..<height {
+            let row = bytes.advanced(by: y * probe.bytesPerRow)
+            for x in 0..<width where row[4 * x + 3] != 0 {
+                left = min(left, x); right = max(right, x + 1)
+                top = min(top, y); bottom = max(bottom, y + 1)
+            }
+        }
+        guard left < right, top < bottom else { return SpriteRaster(image: image) }
+        // Two probe pixels of padding cover antialiasing and subpixel ink.
+        let xScale = CGFloat(image.width) / CGFloat(width)
+        let yScale = CGFloat(image.height) / CGFloat(height)
+        let crop = CGRect(x: CGFloat(left - 2) * xScale, y: CGFloat(top - 2) * yScale,
+                          width: CGFloat(right - left + 4) * xScale, height: CGFloat(bottom - top + 4) * yScale)
+            .integral.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        guard crop.width * crop.height < CGFloat(image.width * image.height) * 0.75,
+              let clipped = image.cropping(to: crop),
+              let bitmap = CGContext(data: nil, width: clipped.width, height: clipped.height,
+                                     bitsPerComponent: 8, bytesPerRow: 0,
+                                     space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return SpriteRaster(image: image) }
+        // A CGImage crop alone retains the entire decoded HEIC canvas.
+        bitmap.draw(clipped, in: CGRect(x: 0, y: 0, width: clipped.width, height: clipped.height))
+        guard let compact = bitmap.makeImage() else { return SpriteRaster(image: image) }
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        return SpriteRaster(image: compact, region: CGRect(x: crop.minX / w, y: 1 - crop.maxY / h,
+                                                            width: crop.width / w, height: crop.height / h))
+    }
+}
+
 /// Decodes HEIC frames away from the Core Animation commit path. `NSImage`
 /// keeps its ImageIO source lazy, so merely creating one on the main thread
 /// still leaves the expensive HEIF decompression for `CALayer` to perform.
@@ -10,17 +62,17 @@ import QuartzCore
 /// decoded pixels. A bounded shared cache and two workers limit memory and CPU.
 final class FrameDecoder {
     private final class Entry {
-        let image: CGImage
+        let frame: SpriteRaster
         let cost: Int
-        init(_ image: CGImage) {
-            self.image = image
-            cost = image.bytesPerRow * image.height
+        init(_ frame: SpriteRaster) {
+            self.frame = frame
+            cost = frame.image.bytesPerRow * frame.image.height
         }
     }
 
     static let shared = FrameDecoder()
 
-    typealias Callback = (CGImage?) -> Void
+    typealias Callback = (SpriteRaster?) -> Void
     private final class Request {
         var clients: Set<UUID> = []
         var callbacks: [UUID: [Callback]] = [:]
@@ -32,6 +84,7 @@ final class FrameDecoder {
     private let decode: (URL, Int) -> CGImage?
     private let lock = NSLock()
     private var inFlight: [String: Request] = [:]
+    private var deliveries: [UUID: [UUID: [Callback]]] = [:]
 
     init(decode: @escaping (URL, Int) -> CGImage? = FrameDecoder.decodeImage) {
         self.decode = decode
@@ -43,25 +96,26 @@ final class FrameDecoder {
         queue.maxConcurrentOperationCount = 2
     }
 
-    func key(for url: URL, maxPixelSize: Int) -> String {
-        "\(url.path)#\(maxPixelSize)"
+    func key(for url: URL, maxPixelSize: Int, trim: Bool = false) -> String {
+        "\(url.path)#\(maxPixelSize)#\(trim)"
     }
 
-    func cachedImage(for url: URL, maxPixelSize: Int) -> CGImage? {
-        cache.object(forKey: key(for: url, maxPixelSize: maxPixelSize) as NSString)?.image
+    func cachedFrame(for url: URL, maxPixelSize: Int, trim: Bool = false) -> SpriteRaster? {
+        cache.object(forKey: key(for: url, maxPixelSize: maxPixelSize, trim: trim) as NSString)?.frame
     }
 
     func request(
         _ url: URL,
         maxPixelSize: Int,
+        trim: Bool = false,
         clientID: UUID,
         completion: Callback? = nil
     ) {
-        let cacheKey = key(for: url, maxPixelSize: maxPixelSize)
+        let cacheKey = key(for: url, maxPixelSize: maxPixelSize, trim: trim)
         lock.lock()
-        if let image = cache.object(forKey: cacheKey as NSString)?.image {
+        if let frame = cache.object(forKey: cacheKey as NSString)?.frame {
             lock.unlock()
-            completion?(image)
+            completion?(frame)
             return
         }
 
@@ -81,10 +135,11 @@ final class FrameDecoder {
 
         operation.addExecutionBlock { [weak self, weak request] in
             guard let self, let request, request.operation?.isCancelled == false else { return }
-            let image = autoreleasepool {
-                self.decode(url, maxPixelSize)
+            let frame: SpriteRaster? = autoreleasepool {
+                guard let image = self.decode(url, maxPixelSize) else { return nil }
+                return trim ? SpriteRaster.trimmingTransparentBorder(image) : SpriteRaster(image: image)
             }
-            self.finish(cacheKey, request: request, image: image)
+            self.finish(cacheKey, request: request, frame: frame)
         }
         queue.addOperation(operation)
     }
@@ -100,6 +155,10 @@ final class FrameDecoder {
                 inFlight.removeValue(forKey: key)
             }
         }
+        for id in Array(deliveries.keys) {
+            deliveries[id]?.removeValue(forKey: clientID)
+            if deliveries[id]?.isEmpty == true { deliveries.removeValue(forKey: id) }
+        }
         lock.unlock()
     }
 
@@ -107,27 +166,37 @@ final class FrameDecoder {
         lock.lock()
         let operations = inFlight.values.compactMap(\.operation)
         inFlight.removeAll()
+        deliveries.removeAll()
         cache.removeAllObjects()
         lock.unlock()
         operations.forEach { $0.cancel() }
     }
 
-    private func finish(_ cacheKey: String, request: Request, image: CGImage?) {
+    private func finish(_ cacheKey: String, request: Request, frame: SpriteRaster?) {
         lock.lock()
         guard inFlight[cacheKey] === request else {
             lock.unlock()
             return
         }
         inFlight.removeValue(forKey: cacheKey)
-        if let image {
-            let entry = Entry(image)
+        if let frame {
+            let entry = Entry(frame)
             cache.setObject(entry, forKey: cacheKey as NSString, cost: entry.cost)
         }
-        let callbacks = request.callbacks.values.flatMap { $0 }
+        let clients = Array(request.callbacks.keys)
+        let delivery = UUID()
+        if !clients.isEmpty { deliveries[delivery] = request.callbacks }
         lock.unlock()
-        guard !callbacks.isEmpty else { return }
-        OperationQueue.main.addOperation {
-            callbacks.forEach { $0(image) }
+        guard !clients.isEmpty else { return }
+        OperationQueue.main.addOperation { [weak self] in
+            guard let self else { return }
+            for client in clients {
+                self.lock.lock()
+                let callbacks = self.deliveries[delivery]?.removeValue(forKey: client)
+                if self.deliveries[delivery]?.isEmpty == true { self.deliveries.removeValue(forKey: delivery) }
+                self.lock.unlock()
+                callbacks?.forEach { $0(frame) }
+            }
         }
     }
 
@@ -164,8 +233,11 @@ final class SpriteAssetPlayer {
     private var desiredFrameKey: String?
     private var pendingFrameKey: String?
     private var displayedFrameKey: String?
-    private var loopImages: [Int: CGImage] = [:]
+    private var loopImages: [Int: SpriteRaster] = [:]
     private var loopPixelSize: Int?
+    private var displayedSprite: SpriteRaster?
+    private var heldVideo: (player: AVPlayer, layer: AVPlayerLayer)?
+    private var sharpBasePose = false
     private var decoderClientID = UUID()
     private var frameURLs: [String: URL] = [:]
     private(set) var isPlaying = false
@@ -217,13 +289,22 @@ final class SpriteAssetPlayer {
         _ asset: AssetRecord,
         targetDuration: TimeInterval = 10,
         repeatWhole: Bool = false,
+        holdFirstVideoFrame: Bool = false,
         completion: (() -> Void)? = nil
     ) {
         // `play` resets any previous media but must preserve the readiness
         // callback the caller just installed for an atomic layer handoff.
         let readinessCallback = onReady
         stop(); onReady = readinessCallback; isPlaying = true
+        sharpBasePose = asset.kind == .characterBasePose
         let phased = asset.sprites.contains { $0.phase != .oneShot }
+        if holdFirstVideoFrame {
+            guard !phased, let sprite = asset.sprites.first, sprite.mediaType == .video else {
+                isPlaying = false; return
+            }
+            playOneShot(sprite, repeatWhole: false, holdFirstVideoFrame: true, completion: completion)
+            return
+        }
         if phased, asset.sprites.allSatisfy({ $0.mediaType == .video }) {
             playSeamlessVideoPhases(asset.sprites, targetDuration: targetDuration, completion: completion)
         } else if phased, asset.sprites.allSatisfy({ $0.mediaType == .frameSequence }) {
@@ -246,7 +327,8 @@ final class SpriteAssetPlayer {
     func resize() {
         for layer in layers {
             guard let descriptor = layerDescriptors[ObjectIdentifier(layer)] else { continue }
-            layer.frame = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
+            let canvas = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
+            layer.frame = layer === frameLayer ? displayedSprite?.frame(in: canvas) ?? canvas : canvas
         }
     }
 
@@ -254,6 +336,15 @@ final class SpriteAssetPlayer {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         layers.forEach { $0.isHidden = hidden }
         CATransaction.commit()
+    }
+
+    func startPreparedVideo() -> Bool {
+        guard isPlaying, let heldVideo, heldVideo.layer.isReadyForDisplay else { return false }
+        self.heldVideo = nil
+        heldVideo.layer.name = "snoopyHideCharacter"
+        reveal(heldVideo.layer)
+        heldVideo.player.play()
+        return true
     }
 
     func stop() {
@@ -265,6 +356,8 @@ final class SpriteAssetPlayer {
         desiredFrameKey = nil
         pendingFrameKey = nil
         displayedFrameKey = nil
+        displayedSprite = nil
+        heldVideo = nil
         loopImages.removeAll()
         loopPixelSize = nil
         frameURLs.removeAll(keepingCapacity: false)
@@ -386,7 +479,7 @@ final class SpriteAssetPlayer {
         }
     }
 
-    private func playOneShot(_ sprite: SpriteDescriptor, repeatWhole: Bool, completion: (() -> Void)?) {
+    private func playOneShot(_ sprite: SpriteDescriptor, repeatWhole: Bool, holdFirstVideoFrame: Bool = false, completion: (() -> Void)?) {
         if sprite.mediaType == .frameSequence {
             let layer = CALayer(); layer.contentsGravity = .resizeAspect
             layer.opacity = 0
@@ -412,6 +505,10 @@ final class SpriteAssetPlayer {
             player.isMuted = true; player.volume = 0; player.actionAtItemEnd = .pause
             let layer = AVPlayerLayer(player: player); configure(layer, sprite: sprite); layer.opacity = 0
             players.append(player)
+            if holdFirstVideoFrame {
+                layer.name = "snoopyPreparedHideCharacter"
+                heldVideo = (player, layer)
+            }
             observers.append(NotificationCenter.default.addObserver(
                 forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
             ) { [weak self, weak player] _ in
@@ -420,11 +517,21 @@ final class SpriteAssetPlayer {
                     player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero); player?.play()
                 } else { self.isPlaying = false; completion?() }
             })
-            observeReady(item, player: player, layer: layer)
+            observeReady(item, player: player, layer: layer, holdFirstVideoFrame: holdFirstVideoFrame)
         } else { isPlaying = false; completion?() }
     }
 
-    private func observeReady(_ item: AVPlayerItem, player: AVPlayer, layer: AVPlayerLayer) {
+    private func observeReady(_ item: AVPlayerItem, player: AVPlayer, layer: AVPlayerLayer, holdFirstVideoFrame: Bool = false) {
+        if holdFirstVideoFrame {
+            observations.append(player.observe(\.status, options: [.initial, .new]) { [weak self] player, _ in
+                DispatchQueue.main.async { [weak self, weak player] in
+                    guard let self, let player, player.status == .readyToPlay,
+                          self.heldVideo?.player === player else { return }
+                    player.preroll(atRate: 1)
+                }
+            })
+            return
+        }
         // Keep the outgoing sprite until the incoming layer can display a
         // frame. Asset readiness alone can precede that point.
         observations.append(layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self, weak player] layer, _ in
@@ -467,8 +574,6 @@ final class SpriteAssetPlayer {
         displayedFrameKey = nil
         loopImages.removeAll()
         loopPixelSize = nil
-        layerDescriptors[ObjectIdentifier(layer)] = descriptor
-        layer.frame = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
         requestFrame(
             descriptor.startFrame,
             descriptor: descriptor,
@@ -497,11 +602,12 @@ final class SpriteAssetPlayer {
             loopImages.removeAll()
             loopPixelSize = pixelSize
         }
-        let key = FrameDecoder.shared.key(for: url, maxPixelSize: pixelSize)
+        let key = FrameDecoder.shared.key(for: url, maxPixelSize: pixelSize, trim: sharpBasePose)
         desiredFrameKey = key
         guard key != displayedFrameKey else { return }
 
-        if let image = loopImages[frameNumber] ?? FrameDecoder.shared.cachedImage(for: url, maxPixelSize: pixelSize) {
+        if let image = loopImages[frameNumber]
+            ?? FrameDecoder.shared.cachedFrame(for: url, maxPixelSize: pixelSize, trim: sharpBasePose) {
             if descriptor.loops { loopImages[frameNumber] = image }
             installFrame(
                 image,
@@ -517,11 +623,12 @@ final class SpriteAssetPlayer {
         FrameDecoder.shared.request(
             url,
             maxPixelSize: pixelSize,
+            trim: sharpBasePose,
             clientID: decoderClientID
         ) { [weak self, weak layer] image in
-            guard let self, let layer else { return }
+            guard let self, let layer, self.frameGeneration == generation else { return }
             if self.pendingFrameKey == key { self.pendingFrameKey = nil }
-            guard let image, self.isPlaying, self.frameGeneration == generation else { return }
+            guard let image, self.isPlaying else { return }
             if descriptor.loops, self.loopPixelSize == pixelSize { self.loopImages[frameNumber] = image }
             guard self.desiredFrameKey == key else { return }
             self.installFrame(
@@ -535,18 +642,24 @@ final class SpriteAssetPlayer {
     }
 
     private func installFrame(
-        _ image: CGImage,
+        _ raster: SpriteRaster,
         key: String,
         layer: CALayer,
         generation: Int,
         completion: (() -> Void)?
     ) {
-        guard isPlaying, frameGeneration == generation, desiredFrameKey == key, frameLayer === layer else { return }
+        guard isPlaying, frameGeneration == generation, desiredFrameKey == key, frameLayer === layer,
+              let descriptor = frameDescriptor else { return }
+        let canvas = ViewportLayout.spriteFrame(descriptor, in: hostBounds(), sceneOffset: sceneOffset)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.contents = image
+        layer.contents = raster.image
+        layer.frame = raster.frame(in: canvas)
+        layerDescriptors[ObjectIdentifier(layer)] = descriptor
+        if sharpBasePose { layer.name = "snoopyIdleBasePose" }
         CATransaction.commit()
         displayedFrameKey = key
+        displayedSprite = raster
         completion?()
     }
 
@@ -561,7 +674,7 @@ final class SpriteAssetPlayer {
             }
             let frame = descriptor.startFrame + local
             guard loopImages[frame] == nil, let url = frameURL(frame, descriptor: descriptor) else { continue }
-            FrameDecoder.shared.request(url, maxPixelSize: pixelSize, clientID: decoderClientID)
+            FrameDecoder.shared.request(url, maxPixelSize: pixelSize, trim: sharpBasePose, clientID: decoderClientID)
             if !descriptor.loops && local == descriptor.frameCount - 1 { break }
         }
     }
@@ -571,11 +684,12 @@ final class SpriteAssetPlayer {
         // Decode at the logical display size. The line-art assets remain crisp,
         // while a 40-frame base-pose loop can stay resident in the bounded
         // cache instead of being decompressed again on every repetition.
-        let longestSide = min(1920, max(frame.width, frame.height))
+        let scale = max(1, host.contentsScale)
+        let longestSide = min(1920, max(frame.width, frame.height) * (sharpBasePose ? scale : 1))
         // Quantization prevents a resize from generating many nearly identical
         // cache variants while still decoding at the current display size.
         let displaySize = max(256, Int(ceil(longestSide / 128)) * 128)
-        guard descriptor.loops else { return displaySize }
+        guard descriptor.loops, !sharpBasePose else { return displaySize }
         // Reserve a whole loop at a bounded size. At 1440 pixels a base-pose
         // loop alone can overflow the shared cache and re-decode every frame
         // on every repetition, churning CoreGraphics and compositor rasters.
