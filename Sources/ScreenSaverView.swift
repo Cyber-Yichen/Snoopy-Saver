@@ -56,6 +56,11 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     private var sessionActive = false
     private var coordinatorKey: String?
     private var nextEnvironmentRefresh: CFTimeInterval = 0
+    private var resourcesSuspended = false
+    private var sawOnscreenWindow = false
+    private var visibilityObserver: NSObjectProtocol?
+    private var resumeActivePlayback = false
+    private var resumeRetiringPlayback = false
 
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview); configure()
@@ -76,6 +81,8 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         nextEnvironmentRefresh = 0
         showBootstrap()
         environment.start()
+        installVisibilityWatch()
+        updateResourceSuspension()
         if catalog != nil { playInitialScene(); return }
         let bundle = Bundle(for: SnoopyScreenSaverView.self)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -116,6 +123,8 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         super.viewDidMoveToWindow()
         if window != nil, sessionActive {
             claimActiveSlot()
+            installVisibilityWatch()
+            updateResourceSuspension()
         } else if window == nil, sessionActive {
             // Deferring avoids treating a transient detach/reattach as the end
             // of a wallpaper session.
@@ -126,8 +135,18 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         }
     }
 
+    override func viewDidHide() {
+        super.viewDidHide()
+        updateResourceSuspension()
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        updateResourceSuspension()
+    }
+
     override func animateOneFrame() {
-        guard sessionActive else { return }
+        guard sessionActive, !resourcesSuspended else { return }
         let now = CACurrentMediaTime()
         idle?.tick()
         retiringIdle?.tick()
@@ -255,7 +274,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         retireCurrentScene()
         retiringIdle?.prepareHidePose(choice?.hidePose)
         let item = AVPlayerItem(url: url), player = AVPlayer(playerItem: item)
-        player.isMuted = true; player.volume = 0; player.actionAtItemEnd = .pause
+        PlayerPolicy.apply(player)
         let container = CALayer(); container.frame = bounds
         container.masksToBounds = true; container.opacity = 0
         let video = AVPlayerLayer(player: player); video.frame = bounds
@@ -523,6 +542,12 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         sessionActive = false
         generation += 1
         playbackEpoch += 1
+        if let visibilityObserver { NotificationCenter.default.removeObserver(visibilityObserver) }
+        visibilityObserver = nil
+        resourcesSuspended = false
+        sawOnscreenWindow = false
+        resumeActivePlayback = false
+        resumeRetiringPlayback = false
         transition?.cancel(); transition = nil
         removeObservers()
         watchdog?.cancel(); watchdog = nil
@@ -581,6 +606,71 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         coordinatorKey = nil
         Self.activeViews = Self.activeViews.filter { $0.value.value != nil }
         return Self.activeViews.isEmpty
+    }
+
+    /// Suspend decode only after the host has shown the window and then taken
+    /// it offscreen or hidden the view. A normal fullscreen saver stays
+    /// `isVisible` for the whole session, so occlusion by itself must not pause it.
+    static func shouldSuspendPlayback(
+        sessionActive: Bool,
+        sawOnscreenWindow: Bool,
+        windowVisible: Bool,
+        viewHidden: Bool
+    ) -> Bool {
+        guard sessionActive else { return false }
+        if windowVisible && !viewHidden { return false }
+        return sawOnscreenWindow
+    }
+
+    private func installVisibilityWatch() {
+        if let visibilityObserver { NotificationCenter.default.removeObserver(visibilityObserver) }
+        visibilityObserver = nil
+        guard let window else { return }
+        visibilityObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateResourceSuspension()
+        }
+    }
+
+    private func updateResourceSuspension() {
+        if window?.isVisible == true && !isHidden { sawOnscreenWindow = true }
+        let suspend = Self.shouldSuspendPlayback(
+            sessionActive: sessionActive,
+            sawOnscreenWindow: sawOnscreenWindow,
+            windowVisible: window?.isVisible == true,
+            viewHidden: isHidden
+        )
+        if suspend {
+            if !resourcesSuspended { setResourcesSuspended(true) }
+        } else if resourcesSuspended {
+            setResourcesSuspended(false)
+        }
+    }
+
+    private func setResourcesSuspended(_ suspended: Bool) {
+        guard resourcesSuspended != suspended else { return }
+        resourcesSuspended = suspended
+        // The screen-saver timer does not always pick up a new interval immediately.
+        // animateOneFrame also returns immediately while suspended.
+        animationTimeInterval = suspended ? 5 : 1.0 / 30
+        if suspended {
+            resumeActivePlayback = (active?.player.rate ?? 0) > 0
+            resumeRetiringPlayback = (retiringActive?.player.rate ?? 0) > 0
+            active?.player.pause()
+            retiringActive?.player.pause()
+        }
+        idle?.setResourcesPaused(suspended)
+        retiringIdle?.setResourcesPaused(suspended)
+        preparedIdle?.setResourcesPaused(suspended)
+        if !suspended {
+            if resumeActivePlayback { active?.player.play() }
+            if resumeRetiringPlayback { retiringActive?.player.play() }
+            resumeActivePlayback = false
+            resumeRetiringPlayback = false
+        }
     }
 
     private func activationKey() -> String? {

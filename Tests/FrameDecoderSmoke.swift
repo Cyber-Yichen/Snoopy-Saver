@@ -18,6 +18,8 @@ struct FrameDecoderSmoke {
         verifyTrimmedPlacement()
         verifyOpaqueDissolve()
         verifyDeferredBoundaryAdvance()
+        verifyPlayerPolicy()
+        verifyOffscreenSuspensionPolicy()
         try verifyNaturalBoundaryAdvance()
         print("Frame decoder smoke passed: in-flight and queued cancellation, trimmed raster placement, opaque dissolve, and deferred end-of-movie advance.")
         if CommandLine.arguments.count == 2 {
@@ -319,6 +321,32 @@ struct FrameDecoderSmoke {
         if writer.status != .completed {
             throw writer.error ?? NSError(domain: "SnoopyBoundary", code: 3)
         }
+    }
+
+    private static func verifyPlayerPolicy() {
+        let player = AVPlayer()
+        PlayerPolicy.apply(player)
+        precondition(!player.allowsExternalPlayback, "external playback stayed enabled")
+        precondition(!player.preventsDisplaySleepDuringVideoPlayback, "video playback still prevents display sleep")
+        precondition(player.isMuted && player.volume == 0 && player.actionAtItemEnd == .pause)
+    }
+
+    private static func verifyOffscreenSuspensionPolicy() {
+        precondition(!SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: true, windowVisible: true, viewHidden: false
+        ), "visible fullscreen playback would be paused")
+        precondition(!SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: false, windowVisible: false, viewHidden: false
+        ), "playback would be paused before the host shows the window")
+        precondition(SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: true, windowVisible: false, viewHidden: false
+        ), "an ordered-out window would keep decoding")
+        precondition(SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: true, windowVisible: true, viewHidden: true
+        ), "a hidden view would keep decoding")
+        precondition(!SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: false, sawOnscreenWindow: true, windowVisible: false, viewHidden: true
+        ))
     }
 
     private static func pumpMain(until deadline: Date, done: () -> Bool = { false }) {

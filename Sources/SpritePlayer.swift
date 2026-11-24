@@ -3,6 +3,21 @@ import AVFoundation
 import ImageIO
 import QuartzCore
 
+enum PlayerPolicy {
+    /// Pin playback so a screensaver movie does not keep the display awake or
+    /// switch to AirPlay. On macOS the sleep property already defaults to
+    /// false (it defaults to true on iOS); setting it documents that choice
+    /// and must happen on the main thread before macOS 13. External playback
+    /// defaults to true, which a screensaver does not want.
+    static func apply(_ player: AVPlayer) {
+        player.isMuted = true
+        player.volume = 0
+        player.actionAtItemEnd = .pause
+        player.allowsExternalPlayback = false
+        player.preventsDisplaySleepDuringVideoPlayback = false
+    }
+}
+
 struct SpriteRaster {
     let image: CGImage
     // Crop in a lower-left-origin, unit-sized source canvas.
@@ -239,6 +254,7 @@ final class SpriteAssetPlayer {
     private var heldVideo: (player: AVPlayer, layer: AVPlayerLayer)?
     private var sharpBasePose = false
     private var decoderClientID = UUID()
+    private var resourcesPaused = false
     private var frameURLs: [String: URL] = [:]
     private(set) var isPlaying = false
     var debugLayerCount: Int { layers.count }
@@ -284,6 +300,18 @@ final class SpriteAssetPlayer {
     deinit { stop() }
 
     static func purgeCaches() { FrameDecoder.shared.removeAll() }
+
+    func setResourcesPaused(_ paused: Bool) {
+        resourcesPaused = paused
+        guard isPlaying else { return }
+        if paused {
+            players.forEach { $0.pause() }
+        } else {
+            for player in players where heldVideo?.player !== player {
+                player.play()
+            }
+        }
+    }
 
     func play(
         _ asset: AssetRecord,
@@ -425,7 +453,7 @@ final class SpriteAssetPlayer {
         guard insertedAny else { isPlaying = false; completion?(); return }
         let item = AVPlayerItem(asset: composition)
         let player = AVPlayer(playerItem: item)
-        player.isMuted = true; player.volume = 0; player.actionAtItemEnd = .pause
+        PlayerPolicy.apply(player)
         let layer = AVPlayerLayer(player: player)
         configure(layer, sprite: entries[0].0); layer.opacity = 0
         players.append(player)
@@ -502,7 +530,7 @@ final class SpriteAssetPlayer {
             }
         } else if let url = sprite.movieURL {
             let item = AVPlayerItem(url: url), player = AVPlayer(playerItem: item)
-            player.isMuted = true; player.volume = 0; player.actionAtItemEnd = .pause
+            PlayerPolicy.apply(player)
             let layer = AVPlayerLayer(player: player); configure(layer, sprite: sprite); layer.opacity = 0
             players.append(player)
             if holdFirstVideoFrame {
@@ -514,7 +542,8 @@ final class SpriteAssetPlayer {
             ) { [weak self, weak player] _ in
                 guard let self, self.isPlaying else { return }
                 if repeatWhole || sprite.loops {
-                    player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero); player?.play()
+                    player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+                    if !self.resourcesPaused { player?.play() }
                 } else { self.isPlaying = false; completion?() }
             })
             observeReady(item, player: player, layer: layer, holdFirstVideoFrame: holdFirstVideoFrame)
@@ -545,7 +574,8 @@ final class SpriteAssetPlayer {
         observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self, weak player] item, _ in
             DispatchQueue.main.async { [weak self, weak player] in
                 guard let self, let player, item.status == .readyToPlay,
-                      self.isPlaying, self.players.contains(where: { $0 === player })
+                      self.isPlaying, !self.resourcesPaused,
+                      self.players.contains(where: { $0 === player })
                 else { return }
                 player.play()
             }
