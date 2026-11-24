@@ -104,6 +104,36 @@ struct ThemeSmokeTests {
         precondition(!EnvironmentProvider.shouldRefresh(
             at: fetched, fetchedAt: fetched.addingTimeInterval(-60), lastAttempt: .distantPast
         ))
+        let emptySuite = "local.snoopy.ScreenSaver.test.\(UUID().uuidString)"
+        let emptyDefaults = UserDefaults(suiteName: emptySuite)!
+        defer { emptyDefaults.removePersistentDomain(forName: emptySuite) }
+        precondition(WeatherAccess.request(defaults: emptyDefaults, environment: [:]) == nil)
+        emptyDefaults.set(true, forKey: WeatherAccess.enabledKey)
+        precondition(WeatherAccess.request(defaults: emptyDefaults, environment: [:]) == nil)
+        emptyDefaults.set(31.2, forKey: WeatherAccess.latitudeKey)
+        emptyDefaults.set(121.5, forKey: WeatherAccess.longitudeKey)
+        precondition(
+            WeatherAccess.request(defaults: emptyDefaults, environment: [:])
+                == WeatherAccess.Request(latitude: 31.2, longitude: 121.5)
+        )
+        precondition(
+            WeatherAccess.request(
+                defaults: emptyDefaults,
+                environment: [WeatherAccess.disableEnvironmentKey: "1"]
+            ) == nil
+        )
+        emptyDefaults.set(120.0, forKey: WeatherAccess.latitudeKey)
+        precondition(WeatherAccess.request(defaults: emptyDefaults, environment: [:]) == nil)
+        let cachedSuite = "local.snoopy.ScreenSaver.test.\(UUID().uuidString)"
+        let cachedDefaults = UserDefaults(suiteName: cachedSuite)!
+        defer { cachedDefaults.removePersistentDomain(forName: cachedSuite) }
+        cachedDefaults.set(try JSONEncoder().encode(cached), forKey: WeatherAccess.cacheKey)
+        let offlineProvider = EnvironmentProvider(defaults: cachedDefaults, processEnvironment: [:])
+        offlineProvider.start()
+        offlineProvider.refreshIfNeeded()
+        let offline = offlineProvider.snapshot(at: fetched)
+        precondition(!offlineProvider.didAttemptWeatherFetch)
+        precondition(!offline.facts.weather.contains("rainy") && offline.sunrise == nil)
         let short = catalog.selectPoseTransition(from: "Pose", eligible: { $0.endPoseID == "Short" })
         precondition(short?.identifier == "ShortPoseChange")
         precondition(catalog.assets(.activeScene).map(\.identifier) == ["A"])

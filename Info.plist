@@ -13,5 +13,4 @@
 <key>LSMinimumSystemVersion</key><string>12.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>SnoopyScreenSaverView</string>
-<key>NSLocationWhenInUseUsageDescription</key><string>Location is used only to match Snoopy scenes to local weather, sunrise, and sunset.</string>
 </dict></plist>

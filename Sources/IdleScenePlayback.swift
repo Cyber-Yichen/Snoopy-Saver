@@ -34,6 +34,7 @@ final class IdleScenePlayback {
     private var nextVisitorAt: CFTimeInterval = 0
     private var visitorSlots: [Range<CFTimeInterval>] = []
     private var pulse: DispatchWorkItem?
+    private var schedulingSuspended = false
     private(set) var currentPoseID: String
     private var animationCounts: [AssetKind: Int] = [.characterBasePose: 1]
     private var prepared = false
@@ -171,6 +172,21 @@ final class IdleScenePlayback {
         }
     }
 
+    func setResourcesPaused(_ paused: Bool) {
+        schedulingSuspended = paused
+        if paused {
+            pulse?.cancel(); pulse = nil
+        } else if sceneEnds != nil {
+            schedulePulse()
+        }
+        permanent.forEach { $0.setResourcesPaused(paused) }
+        character?.setResourcesPaused(paused)
+        previousCharacter?.setResourcesPaused(paused)
+        transitionCharacter?.setResourcesPaused(paused)
+        visitor?.setResourcesPaused(paused)
+        weather?.setResourcesPaused(paused)
+    }
+
     func stopScheduling() {
         pulse?.cancel(); pulse = nil
         sceneEnds = nil; eventEnds = nil
@@ -225,6 +241,7 @@ final class IdleScenePlayback {
     }
 
     private func schedulePulse() {
+        guard !schedulingSuspended else { return }
         let task = DispatchWorkItem { [weak self] in
             guard let self, self.sceneEnds != nil else { return }
             self.advance(at: CACurrentMediaTime())
@@ -376,6 +393,8 @@ final class IdleScenePlayback {
         return deficits.filter { abs($0.1 - maxDeficit) < 0.000_001 }.randomElement()?.0 ?? .characterBasePose
     }
     private func player(offset: CGPoint) -> SpriteAssetPlayer {
-        SpriteAssetPlayer(host: container, sceneOffset: offset) { [weak self] in self?.container.bounds ?? .zero }
+        let player = SpriteAssetPlayer(host: container, sceneOffset: offset) { [weak self] in self?.container.bounds ?? .zero }
+        if schedulingSuspended { player.setResourcesPaused(true) }
+        return player
     }
 }

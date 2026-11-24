@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import CoreGraphics
+import CoreVideo
 import Foundation
 import QuartzCore
 
@@ -16,7 +17,15 @@ struct FrameDecoderSmoke {
         verifyQueuedCancellation(image: image)
         verifyTrimmedPlacement()
         verifyOpaqueDissolve()
-        print("Frame decoder smoke passed: in-flight and queued cancellation, trimmed raster placement, and opaque dissolve.")
+        verifyDeferredBoundaryAdvance()
+        verifyPlayerPolicy()
+        verifyOffscreenSuspensionPolicy()
+        verifyMediaTimingFallbackRemoved()
+        verifyMediaTimingCancellation()
+        verifyFrameRetention()
+        verifySuspendedClock()
+        try verifyNaturalBoundaryAdvance()
+        print("Frame decoder smoke passed: in-flight and queued cancellation, trimmed raster placement, opaque dissolve, and deferred end-of-movie advance.")
         if CommandLine.arguments.count == 2 {
             try verifyNativeHide(resources: URL(fileURLWithPath: CommandLine.arguments[1]))
         }
@@ -177,5 +186,239 @@ struct FrameDecoderSmoke {
         }
         precondition(callbackCount == 1 && receivedImage === image)
         precondition(decoder.cachedFrame(for: frame, maxPixelSize: 256)?.image === image)
+    }
+
+    private static func verifyDeferredBoundaryAdvance() {
+        var epoch = 4
+        var sessionActive = true
+        var playerCurrent = true
+        var ran = false
+        SceneAdvance.deferBoundaryAdvance(
+            sessionActive: { sessionActive },
+            epoch: { epoch },
+            capturedEpoch: 4,
+            playerStillCurrent: { playerCurrent },
+            advance: { ran = true }
+        )
+        precondition(!ran, "boundary callback switched scenes before returning")
+        epoch = 5
+        pumpMain(until: Date().addingTimeInterval(0.4), done: { ran })
+        precondition(!ran, "stale scene epoch was allowed to advance")
+        epoch = 7
+        playerCurrent = false
+        var rejected = false
+        SceneAdvance.deferBoundaryAdvance(
+            sessionActive: { sessionActive },
+            epoch: { epoch },
+            capturedEpoch: 7,
+            playerStillCurrent: { playerCurrent },
+            advance: { rejected = true }
+        )
+        pumpMain(until: Date().addingTimeInterval(0.4), done: { rejected })
+        precondition(!rejected, "advance ran after the player was replaced")
+        playerCurrent = true
+        sessionActive = false
+        var stopped = false
+        SceneAdvance.deferBoundaryAdvance(
+            sessionActive: { sessionActive },
+            epoch: { epoch },
+            capturedEpoch: 7,
+            playerStillCurrent: { playerCurrent },
+            advance: { stopped = true }
+        )
+        pumpMain(until: Date().addingTimeInterval(0.4), done: { stopped })
+        precondition(!stopped, "advance ran after the session stopped")
+        sessionActive = true
+        var accepted = false
+        SceneAdvance.deferBoundaryAdvance(
+            sessionActive: { sessionActive },
+            epoch: { epoch },
+            capturedEpoch: 7,
+            playerStillCurrent: { playerCurrent },
+            advance: { accepted = true }
+        )
+        pumpMain(until: Date().addingTimeInterval(1), done: { accepted })
+        precondition(accepted, "current epoch did not advance on the following turn")
+    }
+
+    private static func verifyNaturalBoundaryAdvance() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("snoopy-boundary-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("clip.mov")
+        try writeSilentClip(to: url, seconds: 0.5)
+        let player = AVPlayer(playerItem: AVPlayerItem(url: url))
+        player.isMuted = true
+        player.volume = 0
+        var insideCallback = false
+        var removedInsideCallback = false
+        var advances = 0
+        var epoch = 1
+        var token: Any?
+        token = player.addBoundaryTimeObserver(
+            forTimes: [NSValue(time: CMTime(seconds: 0.15, preferredTimescale: 600))],
+            queue: .main
+        ) {
+            insideCallback = true
+            let observer = token
+            SceneAdvance.deferBoundaryAdvance(
+                sessionActive: { true },
+                epoch: { epoch },
+                capturedEpoch: 1,
+                playerStillCurrent: { true },
+                advance: {
+                    removedInsideCallback = insideCallback
+                    if let observer { player.removeTimeObserver(observer) }
+                    advances += 1
+                    epoch += 1
+                }
+            )
+            insideCallback = false
+        }
+        player.play()
+        pumpMain(until: Date().addingTimeInterval(5), done: { advances > 0 })
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        precondition(advances == 1, "natural boundary did not advance exactly once")
+        precondition(!removedInsideCallback, "time observer was removed inside its own callback")
+    }
+
+    private static func writeSilentClip(to url: URL, seconds: Double) throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: 16,
+            AVVideoHeightKey: 16,
+        ])
+        writer.add(input)
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: 16,
+                kCVPixelBufferHeightKey as String: 16,
+            ]
+        )
+        guard writer.startWriting() else {
+            throw writer.error ?? NSError(domain: "SnoopyBoundary", code: 1)
+        }
+        writer.startSession(atSourceTime: .zero)
+        var pixelBuffer: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
+        guard let pixelBuffer else { throw NSError(domain: "SnoopyBoundary", code: 2) }
+        let fps = 10
+        let frameCount = max(2, Int(seconds * Double(fps)))
+        for index in 0..<frameCount {
+            let readyDeadline = Date().addingTimeInterval(2)
+            while !input.isReadyForMoreMediaData && Date() < readyDeadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            precondition(input.isReadyForMoreMediaData, "asset writer was not ready")
+            let time = CMTime(value: CMTimeValue(index), timescale: CMTimeScale(fps))
+            precondition(adaptor.append(pixelBuffer, withPresentationTime: time), "could not append a test frame")
+        }
+        input.markAsFinished()
+        let finished = DispatchSemaphore(value: 0)
+        writer.finishWriting { finished.signal() }
+        precondition(finished.wait(timeout: .now() + 5) == .success, "asset writer did not finish")
+        if writer.status != .completed {
+            throw writer.error ?? NSError(domain: "SnoopyBoundary", code: 3)
+        }
+    }
+
+    private static func verifyPlayerPolicy() {
+        let player = AVPlayer()
+        PlayerPolicy.apply(player)
+        precondition(!player.allowsExternalPlayback, "external playback stayed enabled")
+        precondition(!player.preventsDisplaySleepDuringVideoPlayback, "video playback still prevents display sleep")
+        precondition(player.isMuted && player.volume == 0 && player.actionAtItemEnd == .pause)
+    }
+
+    private static func verifyMediaTimingFallbackRemoved() {
+        precondition(MediaTiming.validatedDuration(seconds: 1.25, loaded: true) == 1.25)
+        precondition(MediaTiming.validatedDuration(seconds: 0, loaded: true) == nil)
+        precondition(MediaTiming.validatedDuration(seconds: .nan, loaded: true) == nil)
+        precondition(MediaTiming.validatedDuration(seconds: 2, loaded: false) == nil)
+        precondition(MediaTiming.loopRepeatCount(loopDuration: 2, desiredLoop: 5) == 3)
+        precondition(MediaTiming.loopRepeatCount(loopDuration: 0, desiredLoop: 10) == nil)
+        precondition(MediaTiming.loopRepeatCount(loopDuration: .infinity, desiredLoop: 10) == nil)
+        let missing = URL(fileURLWithPath: "/tmp/snoopy-missing-\(UUID().uuidString).mov")
+        let finished = DispatchSemaphore(value: 0)
+        MediaTimingCache.shared.load(missing) { value in
+            precondition(value == nil, "a missing movie was given a placeholder duration")
+            finished.signal()
+        }
+        precondition(finished.wait(timeout: .now() + 5) == .success, "duration load did not finish")
+        precondition(MediaTimingCache.shared.duration(for: missing) == nil)
+    }
+
+    private static func verifyFrameRetention() {
+        let wrapped = SpriteAssetPlayer.retentionWindow(current: 4, start: 0, count: 5, limit: 3)
+        precondition(wrapped == Set([4, 0, 1]), "sharp loop window did not wrap")
+        let whole = SpriteAssetPlayer.retentionWindow(current: 12, start: 10, count: 4, limit: 8)
+        precondition(whole == Set([10, 11, 12, 13]))
+        let context = CGContext(
+            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        let image = context.makeImage()!
+        precondition(FrameDecoder.imageCost(image) >= image.width * image.height * 4)
+        let outline = SpriteRaster(image: image)
+        let hide = TransitionFrames.Phase(mask: [image, image, image], outline: [outline, outline, outline])
+        let reveal = TransitionFrames.Phase(mask: [image], outline: [outline])
+        let frames = TransitionFrames(testingHide: hide, reveal: reveal)
+        precondition(frames.debugHideFrameCount == 3 && frames.debugRevealFrameCount == 1)
+        frames.releaseHideFrames()
+        precondition(frames.debugHideFrameCount == 0, "hide frames stayed resident after the wipe")
+        precondition(frames.debugRevealFrameCount == 1, "releasing hide dropped the reveal phase")
+    }
+
+    private static func verifySuspendedClock() {
+        let pauseBegan: CFTimeInterval = 100
+        let resumedAt: CFTimeInterval = 130
+        precondition(SpriteAssetPlayer.resumedFrameStart(
+            frameStarted: 90, pauseBegan: pauseBegan, resumedAt: resumedAt
+        ) == 120)
+        precondition(SpriteAssetPlayer.resumedFrameStart(
+            frameStarted: 0, pauseBegan: pauseBegan, resumedAt: resumedAt
+        ) == 0)
+        precondition(SpriteAssetPlayer.shiftedFireTime(
+            fireAt: pauseBegan + 1.5, pauseBegan: pauseBegan, resumedAt: resumedAt
+        ) == resumedAt + 1.5)
+    }
+
+    private static func verifyMediaTimingCancellation() {
+        let flag = CancelFlag()
+        precondition(!flag.isCancelled)
+        flag.cancel()
+        precondition(flag.isCancelled)
+        let missing = URL(fileURLWithPath: "/tmp/snoopy-cancelled-\(UUID().uuidString).mov")
+        precondition(MediaTimingCache.loadSource(missing, cancel: flag) == nil)
+    }
+
+    private static func verifyOffscreenSuspensionPolicy() {
+        precondition(!SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: true, windowVisible: true, viewHidden: false
+        ), "visible fullscreen playback would be paused")
+        precondition(!SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: false, windowVisible: false, viewHidden: false
+        ), "playback would be paused before the host shows the window")
+        precondition(SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: true, windowVisible: false, viewHidden: false
+        ), "an ordered-out window would keep decoding")
+        precondition(SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: true, sawOnscreenWindow: true, windowVisible: true, viewHidden: true
+        ), "a hidden view would keep decoding")
+        precondition(!SnoopyScreenSaverView.shouldSuspendPlayback(
+            sessionActive: false, sawOnscreenWindow: true, windowVisible: false, viewHidden: true
+        ))
+    }
+
+    private static func pumpMain(until deadline: Date, done: () -> Bool = { false }) {
+        while Date() < deadline && !done() {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
     }
 }

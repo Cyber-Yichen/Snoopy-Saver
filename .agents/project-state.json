@@ -44,7 +44,15 @@
       "circularWipe",
       "thoughtBubble",
       "sleepingDreamBubble"
-    ]
+    ],
+    "environmentIO": {
+      "default": "offline",
+      "locationAuthorization": "never",
+      "network": "explicit-opt-in",
+      "fallbackCoordinates": false,
+      "defaultsSuite": "local.snoopy.ScreenSaver",
+      "killSwitch": "SNOOPY_DISABLE_ENVIRONMENT_IO"
+    }
   },
   "forbiddenReadPaths": [
     "/Users/yichen/Documents/Git/Snoopy-archive-20260711",

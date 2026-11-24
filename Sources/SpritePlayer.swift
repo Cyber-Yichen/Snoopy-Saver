@@ -3,6 +3,21 @@ import AVFoundation
 import ImageIO
 import QuartzCore
 
+enum PlayerPolicy {
+    /// Pin playback so a screensaver movie does not keep the display awake or
+    /// switch to AirPlay. On macOS the sleep property already defaults to
+    /// false (it defaults to true on iOS); setting it documents that choice
+    /// and must happen on the main thread before macOS 13. External playback
+    /// defaults to true, which a screensaver does not want.
+    static func apply(_ player: AVPlayer) {
+        player.isMuted = true
+        player.volume = 0
+        player.actionAtItemEnd = .pause
+        player.allowsExternalPlayback = false
+        player.preventsDisplaySleepDuringVideoPlayback = false
+    }
+}
+
 struct SpriteRaster {
     let image: CGImage
     // Crop in a lower-left-origin, unit-sized source canvas.
@@ -66,7 +81,7 @@ final class FrameDecoder {
         let cost: Int
         init(_ frame: SpriteRaster) {
             self.frame = frame
-            cost = frame.image.bytesPerRow * frame.image.height
+            cost = FrameDecoder.imageCost(frame.image)
         }
     }
 
@@ -200,6 +215,11 @@ final class FrameDecoder {
         }
     }
 
+    static func imageCost(_ image: CGImage) -> Int {
+        let row = image.bytesPerRow > 0 ? image.bytesPerRow : image.width * 4
+        return max(1, row * max(image.height, 1))
+    }
+
     static func decodeImage(_ url: URL, maxPixelSize: Int) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(
             url as CFURL,
@@ -224,7 +244,17 @@ final class SpriteAssetPlayer {
     private var players: [AVPlayer] = []
     private var observers: [NSObjectProtocol] = []
     private var observations: [NSKeyValueObservation] = []
-    private var workItems: [DispatchWorkItem] = []
+    private final class PhaseTimer {
+        let block: () -> Void
+        var fireAt: CFTimeInterval
+        var item: DispatchWorkItem?
+        init(block: @escaping () -> Void, fireAt: CFTimeInterval) {
+            self.block = block
+            self.fireAt = fireAt
+        }
+    }
+    private var phaseTimers: [PhaseTimer] = []
+    private var pauseBegan: CFTimeInterval?
     private var frameLayer: CALayer?
     private var frameDescriptor: SpriteDescriptor?
     private var frameStarted: CFTimeInterval = 0
@@ -239,6 +269,8 @@ final class SpriteAssetPlayer {
     private var heldVideo: (player: AVPlayer, layer: AVPlayerLayer)?
     private var sharpBasePose = false
     private var decoderClientID = UUID()
+    private var resourcesPaused = false
+    private var mediaCancel = CancelFlag()
     private var frameURLs: [String: URL] = [:]
     private(set) var isPlaying = false
     var debugLayerCount: Int { layers.count }
@@ -273,8 +305,7 @@ final class SpriteAssetPlayer {
     }
 
     private static func mediaDuration(_ url: URL) -> TimeInterval? {
-        let value = AVURLAsset(url: url).duration.seconds
-        return value.isFinite && value > 0 ? value : nil
+        MediaTimingCache.shared.duration(for: url)
     }
 
     init(host: CALayer, sceneOffset: CGPoint, hostBounds: @escaping () -> CGRect) {
@@ -283,7 +314,72 @@ final class SpriteAssetPlayer {
 
     deinit { stop() }
 
+    static let sharpLoopWindow = 8
+
+    /// Frames kept for a sharp looping pose: the visible frame plus the
+    /// existing prefetch depth. The displayed image stays at display
+    /// resolution; older frames are not pinned for the whole loop.
+    /// Keep the same elapsed frame after a pause. A start of zero means the
+    /// first frame has not been displayed yet, so there is nothing to shift.
+    static func resumedFrameStart(
+        frameStarted: CFTimeInterval, pauseBegan: CFTimeInterval, resumedAt: CFTimeInterval
+    ) -> CFTimeInterval {
+        guard frameStarted > 0 else { return frameStarted }
+        return frameStarted + (resumedAt - pauseBegan)
+    }
+
+    static func shiftedFireTime(
+        fireAt: CFTimeInterval, pauseBegan: CFTimeInterval, resumedAt: CFTimeInterval
+    ) -> CFTimeInterval {
+        fireAt + (resumedAt - pauseBegan)
+    }
+
+    static func retentionWindow(current: Int, start: Int, count: Int, limit: Int) -> Set<Int> {
+        guard count > 0, limit > 0 else { return [current] }
+        let span = min(limit, count)
+        let raw = (current - start) % count
+        let local = raw >= 0 ? raw : raw + count
+        var keys = Set<Int>()
+        for offset in 0..<span {
+            keys.insert(start + (local + offset) % count)
+        }
+        return keys
+    }
+
     static func purgeCaches() { FrameDecoder.shared.removeAll() }
+
+    func setResourcesPaused(_ paused: Bool) {
+        if paused == resourcesPaused {
+            if paused, isPlaying { players.forEach { $0.pause() } }
+            return
+        }
+        resourcesPaused = paused
+        if paused {
+            pauseBegan = CACurrentMediaTime()
+            suspendPhaseTimers()
+            if isPlaying { players.forEach { $0.pause() } }
+            return
+        }
+        let began = pauseBegan ?? CACurrentMediaTime()
+        let resumedAt = CACurrentMediaTime()
+        frameStarted = Self.resumedFrameStart(
+            frameStarted: frameStarted, pauseBegan: began, resumedAt: resumedAt
+        )
+        for timer in phaseTimers {
+            timer.fireAt = Self.shiftedFireTime(fireAt: timer.fireAt, pauseBegan: began, resumedAt: resumedAt)
+        }
+        pauseBegan = nil
+        for timer in phaseTimers { arm(timer) }
+        guard isPlaying else { return }
+        heldVideo?.player.preroll(atRate: 1)
+        for player in players where heldVideo?.player !== player {
+            player.play()
+        }
+    }
+
+    private func playbackNow() -> CFTimeInterval {
+        pauseBegan ?? CACurrentMediaTime()
+    }
 
     func play(
         _ asset: AssetRecord,
@@ -295,7 +391,10 @@ final class SpriteAssetPlayer {
         // `play` resets any previous media but must preserve the readiness
         // callback the caller just installed for an atomic layer handoff.
         let readinessCallback = onReady
-        stop(); onReady = readinessCallback; isPlaying = true
+        stop()
+        mediaCancel = CancelFlag()
+        onReady = readinessCallback
+        isPlaying = true
         sharpBasePose = asset.kind == .characterBasePose
         let phased = asset.sprites.contains { $0.phase != .oneShot }
         if holdFirstVideoFrame {
@@ -318,7 +417,7 @@ final class SpriteAssetPlayer {
 
     func tick() {
         guard frameReady, let descriptor = frameDescriptor, let layer = frameLayer else { return }
-        let elapsed = Int(max(0, CACurrentMediaTime() - frameStarted) * SpriteDescriptor.framesPerSecond)
+        let elapsed = Int(max(0, playbackNow() - frameStarted) * SpriteDescriptor.framesPerSecond)
         let local = descriptor.loops ? elapsed % descriptor.frameCount : min(descriptor.frameCount - 1, elapsed)
         requestFrame(descriptor.startFrame + local, descriptor: descriptor, layer: layer, generation: frameGeneration)
         prefetch(descriptor, after: local, count: 6)
@@ -343,11 +442,13 @@ final class SpriteAssetPlayer {
         self.heldVideo = nil
         heldVideo.layer.name = "snoopyHideCharacter"
         reveal(heldVideo.layer)
-        heldVideo.player.play()
+        if resourcesPaused { heldVideo.player.pause() }
+        else { heldVideo.player.play() }
         return true
     }
 
     func stop() {
+        mediaCancel.cancel()
         isPlaying = false
         FrameDecoder.shared.cancelRequests(for: decoderClientID)
         decoderClientID = UUID()
@@ -362,7 +463,10 @@ final class SpriteAssetPlayer {
         loopPixelSize = nil
         frameURLs.removeAll(keepingCapacity: false)
         onReady = nil
-        workItems.forEach { $0.cancel() }; workItems.removeAll()
+        // Keep resourcesPaused and pauseBegan. play() calls stop() before
+        // installing the next asset, and that asset must stay suspended too.
+        for timer in phaseTimers { timer.item?.cancel() }
+        phaseTimers.removeAll()
         observers.forEach(NotificationCenter.default.removeObserver); observers.removeAll()
         observations.forEach { $0.invalidate() }; observations.removeAll()
         layers.compactMap { $0 as? AVPlayerLayer }.forEach { $0.player = nil }
@@ -385,55 +489,108 @@ final class SpriteAssetPlayer {
         targetDuration: TimeInterval,
         completion: (() -> Void)?
     ) {
-        guard let first = sprites.first, let firstURL = first.movieURL else { isPlaying = false; completion?(); return }
+        guard let first = sprites.first, first.movieURL != nil else { isPlaying = false; completion?(); return }
+        let cancel = mediaCancel
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let built = Self.makeSeamlessComposition(sprites, targetDuration: targetDuration, cancel: cancel)
+            DispatchQueue.main.async {
+                guard let self, self.isPlaying, self.mediaCancel === cancel, !cancel.isCancelled else { return }
+                guard let built else {
+                    self.isPlaying = false
+                    completion?()
+                    return
+                }
+                self.installSeamlessPlayer(built.composition, sprite: built.sprite, completion: completion)
+            }
+        }
+    }
+
+    private struct SeamlessBuild {
+        let composition: AVMutableComposition
+        let sprite: SpriteDescriptor
+    }
+
+    private static func makeSeamlessComposition(
+        _ sprites: [SpriteDescriptor],
+        targetDuration: TimeInterval,
+        cancel: CancelFlag
+    ) -> SeamlessBuild? {
+        if cancel.isCancelled { return nil }
         let intro = sprites.first { $0.phase == .intro }
         let loop = sprites.first { $0.phase == .loop }
         let outro = sprites.first { $0.phase == .outro }
-        let introDuration = intro.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0
-        let loopDuration = loop.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0.1
-        let outroDuration = outro.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0
-        let desiredLoop = max(loopDuration, targetDuration - introDuration - outroDuration)
-        let loopCount = max(1, Int((desiredLoop / loopDuration).rounded()))
-        var entries: [(SpriteDescriptor, URL)] = []
-        if let intro, let url = intro.movieURL { entries.append((intro, url)) }
-        if let loop, let url = loop.movieURL { for _ in 0..<loopCount { entries.append((loop, url)) } }
-        if let outro, let url = outro.movieURL { entries.append((outro, url)) }
-        if entries.isEmpty { entries = [(first, firstURL)] }
+        func loaded(_ sprite: SpriteDescriptor?) -> (asset: AVURLAsset, track: AVAssetTrack, duration: CMTime)? {
+            guard let sprite, let url = sprite.movieURL else { return nil }
+            return MediaTimingCache.loadSource(url, cancel: cancel)
+        }
+        let introSource = loaded(intro)
+        let loopSource = loaded(loop)
+        let outroSource = loaded(outro)
+        if intro != nil && introSource == nil { return nil }
+        if outro != nil && outroSource == nil { return nil }
+        guard let loop, let loopSource,
+              let loopDuration = MediaTiming.validatedDuration(seconds: loopSource.duration.seconds, loaded: true),
+              let loopCount = MediaTiming.loopRepeatCount(
+                loopDuration: loopDuration,
+                desiredLoop: max(loopDuration, targetDuration - (introSource?.duration.seconds ?? 0) - (outroSource?.duration.seconds ?? 0))
+              )
+        else { return nil }
+        var entries: [(SpriteDescriptor, AVURLAsset, AVAssetTrack, CMTime)] = []
+        if let intro, let introSource {
+            entries.append((intro, introSource.asset, introSource.track, introSource.duration))
+        }
+        for _ in 0..<loopCount {
+            entries.append((loop, loopSource.asset, loopSource.track, loopSource.duration))
+        }
+        if let outro, let outroSource {
+            entries.append((outro, outroSource.asset, outroSource.track, outroSource.duration))
+        }
+        guard !cancel.isCancelled else { return nil }
         let composition = AVMutableComposition()
         guard let compositionTrack = composition.addMutableTrack(
             withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid
-        ) else { isPlaying = false; completion?(); return }
+        ) else { return nil }
         var cursor = CMTime.zero
         var insertedAny = false
-        var sources: [URL: AVURLAsset] = [:]
-        for (_, url) in entries {
-            let sourceAsset = sources[url] ?? AVURLAsset(url: url)
-            sources[url] = sourceAsset
-            guard let sourceTrack = sourceAsset.tracks(withMediaType: .video).first else { continue }
-            let sourceDuration = sourceAsset.duration
-            guard sourceDuration.isValid, sourceDuration.seconds.isFinite, sourceDuration.seconds > 0 else { continue }
+        for entry in entries {
+            if cancel.isCancelled { return nil }
             do {
                 try compositionTrack.insertTimeRange(
-                    CMTimeRange(start: .zero, duration: sourceDuration), of: sourceTrack, at: cursor
+                    CMTimeRange(start: .zero, duration: entry.3), of: entry.2, at: cursor
                 )
-                if !insertedAny { compositionTrack.preferredTransform = sourceTrack.preferredTransform }
-                cursor = CMTimeAdd(cursor, sourceDuration); insertedAny = true
+                if !insertedAny,
+                   entry.2.statusOfValue(forKey: "preferredTransform", error: nil) == .loaded {
+                    compositionTrack.preferredTransform = entry.2.preferredTransform
+                }
+                cursor = CMTimeAdd(cursor, entry.3)
+                insertedAny = true
             } catch {
                 NSLog("Snoopy sprite composition error: %@", String(describing: error))
+                return nil
             }
         }
-        guard insertedAny else { isPlaying = false; completion?(); return }
+        guard insertedAny else { return nil }
+        return SeamlessBuild(composition: composition, sprite: entries[0].0)
+    }
+
+    private func installSeamlessPlayer(
+        _ composition: AVMutableComposition,
+        sprite: SpriteDescriptor,
+        completion: (() -> Void)?
+    ) {
         let item = AVPlayerItem(asset: composition)
         let player = AVPlayer(playerItem: item)
-        player.isMuted = true; player.volume = 0; player.actionAtItemEnd = .pause
+        PlayerPolicy.apply(player)
         let layer = AVPlayerLayer(player: player)
-        configure(layer, sprite: entries[0].0); layer.opacity = 0
+        configure(layer, sprite: sprite)
+        layer.opacity = 0
         players.append(player)
         observers.append(NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
             guard let self, self.isPlaying else { return }
-            self.isPlaying = false; completion?()
+            self.isPlaying = false
+            completion?()
         })
         observeReady(item, player: player, layer: layer)
     }
@@ -502,7 +659,7 @@ final class SpriteAssetPlayer {
             }
         } else if let url = sprite.movieURL {
             let item = AVPlayerItem(url: url), player = AVPlayer(playerItem: item)
-            player.isMuted = true; player.volume = 0; player.actionAtItemEnd = .pause
+            PlayerPolicy.apply(player)
             let layer = AVPlayerLayer(player: player); configure(layer, sprite: sprite); layer.opacity = 0
             players.append(player)
             if holdFirstVideoFrame {
@@ -514,7 +671,8 @@ final class SpriteAssetPlayer {
             ) { [weak self, weak player] _ in
                 guard let self, self.isPlaying else { return }
                 if repeatWhole || sprite.loops {
-                    player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero); player?.play()
+                    player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+                    if !self.resourcesPaused { player?.play() }
                 } else { self.isPlaying = false; completion?() }
             })
             observeReady(item, player: player, layer: layer, holdFirstVideoFrame: holdFirstVideoFrame)
@@ -526,7 +684,7 @@ final class SpriteAssetPlayer {
             observations.append(player.observe(\.status, options: [.initial, .new]) { [weak self] player, _ in
                 DispatchQueue.main.async { [weak self, weak player] in
                     guard let self, let player, player.status == .readyToPlay,
-                          self.heldVideo?.player === player else { return }
+                          self.heldVideo?.player === player, !self.resourcesPaused else { return }
                     player.preroll(atRate: 1)
                 }
             })
@@ -545,7 +703,8 @@ final class SpriteAssetPlayer {
         observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self, weak player] item, _ in
             DispatchQueue.main.async { [weak self, weak player] in
                 guard let self, let player, item.status == .readyToPlay,
-                      self.isPlaying, self.players.contains(where: { $0 === player })
+                      self.isPlaying, !self.resourcesPaused,
+                      self.players.contains(where: { $0 === player })
                 else { return }
                 player.play()
             }
@@ -582,7 +741,7 @@ final class SpriteAssetPlayer {
         ) { [weak self, weak layer] in
             guard let self, let layer, self.isPlaying, self.frameGeneration == generation else { return }
             self.frameReady = true
-            self.frameStarted = CACurrentMediaTime()
+            self.frameStarted = self.playbackNow()
             self.reveal(layer)
             completion?()
         }
@@ -608,7 +767,7 @@ final class SpriteAssetPlayer {
 
         if let image = loopImages[frameNumber]
             ?? FrameDecoder.shared.cachedFrame(for: url, maxPixelSize: pixelSize, trim: sharpBasePose) {
-            if descriptor.loops { loopImages[frameNumber] = image }
+            storeLoopFrame(frameNumber, image: image, descriptor: descriptor, pixelSize: pixelSize)
             installFrame(
                 image,
                 key: key,
@@ -629,8 +788,8 @@ final class SpriteAssetPlayer {
             guard let self, let layer, self.frameGeneration == generation else { return }
             if self.pendingFrameKey == key { self.pendingFrameKey = nil }
             guard let image, self.isPlaying else { return }
-            if descriptor.loops, self.loopPixelSize == pixelSize { self.loopImages[frameNumber] = image }
             guard self.desiredFrameKey == key else { return }
+            self.storeLoopFrame(frameNumber, image: image, descriptor: descriptor, pixelSize: pixelSize)
             self.installFrame(
                 image,
                 key: key,
@@ -639,6 +798,24 @@ final class SpriteAssetPlayer {
                 completion: firstFrameCompletion
             )
         }
+    }
+
+    private func storeLoopFrame(
+        _ frame: Int,
+        image: SpriteRaster,
+        descriptor: SpriteDescriptor,
+        pixelSize: Int
+    ) {
+        guard descriptor.loops, loopPixelSize == pixelSize else { return }
+        loopImages[frame] = image
+        guard sharpBasePose else { return }
+        let keep = Self.retentionWindow(
+            current: frame,
+            start: descriptor.startFrame,
+            count: descriptor.frameCount,
+            limit: Self.sharpLoopWindow
+        )
+        loopImages = loopImages.filter { keep.contains($0.key) }
     }
 
     private func installFrame(
@@ -714,7 +891,27 @@ final class SpriteAssetPlayer {
         host.addSublayer(layer); layers.append(layer)
     }
     private func schedule(_ delay: TimeInterval, _ block: @escaping () -> Void) {
-        let item = DispatchWorkItem(block: block); workItems.append(item)
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.01, delay), execute: item)
+        let timer = PhaseTimer(block: block, fireAt: playbackNow() + max(0.01, delay))
+        phaseTimers.append(timer)
+        arm(timer)
+    }
+
+    private func arm(_ timer: PhaseTimer) {
+        guard !resourcesPaused else { return }
+        let delay = max(0.01, timer.fireAt - CACurrentMediaTime())
+        let item = DispatchWorkItem { [weak self, weak timer] in
+            guard let self, let timer else { return }
+            self.phaseTimers.removeAll { $0 === timer }
+            timer.block()
+        }
+        timer.item = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func suspendPhaseTimers() {
+        for timer in phaseTimers {
+            timer.item?.cancel()
+            timer.item = nil
+        }
     }
 }
