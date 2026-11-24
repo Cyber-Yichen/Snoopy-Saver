@@ -316,6 +316,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
                 player.play()
             }) { [weak self, weak player] in
                 guard let self, let player, self.active?.player === player else { return }
+                self.active?.transitionFrames?.releaseHideFrames()
                 self.finishTransition()
             }
         }
@@ -426,6 +427,10 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     }
 
     private func prepareIdleForActiveExit() {
+        // Reveal frames are not decoded with Hide. Start them about a second
+        // before the movie ending, instead of retaining both phases for the
+        // whole ActiveScene.
+        active?.transitionFrames?.prepareReveal()
         guard sessionActive, preparedIdle == nil else { return }
         let duration = Double.random(in: 20...60)
         guard let incoming = makeIdlePlayback(preserving: active?.preservedIdle, duration: duration) else { return }

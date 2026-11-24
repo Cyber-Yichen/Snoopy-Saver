@@ -22,6 +22,7 @@ struct FrameDecoderSmoke {
         verifyOffscreenSuspensionPolicy()
         verifyMediaTimingFallbackRemoved()
         verifyMediaTimingCancellation()
+        verifyFrameRetention()
         try verifyNaturalBoundaryAdvance()
         print("Frame decoder smoke passed: in-flight and queued cancellation, trimmed raster placement, opaque dissolve, and deferred end-of-movie advance.")
         if CommandLine.arguments.count == 2 {
@@ -349,6 +350,28 @@ struct FrameDecoderSmoke {
         }
         precondition(finished.wait(timeout: .now() + 5) == .success, "duration load did not finish")
         precondition(MediaTimingCache.shared.duration(for: missing) == nil)
+    }
+
+    private static func verifyFrameRetention() {
+        let wrapped = SpriteAssetPlayer.retentionWindow(current: 4, start: 0, count: 5, limit: 3)
+        precondition(wrapped == Set([4, 0, 1]), "sharp loop window did not wrap")
+        let whole = SpriteAssetPlayer.retentionWindow(current: 12, start: 10, count: 4, limit: 8)
+        precondition(whole == Set([10, 11, 12, 13]))
+        let context = CGContext(
+            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        let image = context.makeImage()!
+        precondition(FrameDecoder.imageCost(image) >= image.width * image.height * 4)
+        let outline = SpriteRaster(image: image)
+        let hide = TransitionFrames.Phase(mask: [image, image, image], outline: [outline, outline, outline])
+        let reveal = TransitionFrames.Phase(mask: [image], outline: [outline])
+        let frames = TransitionFrames(testingHide: hide, reveal: reveal)
+        precondition(frames.debugHideFrameCount == 3 && frames.debugRevealFrameCount == 1)
+        frames.releaseHideFrames()
+        precondition(frames.debugHideFrameCount == 0, "hide frames stayed resident after the wipe")
+        precondition(frames.debugRevealFrameCount == 1, "releasing hide dropped the reveal phase")
     }
 
     private static func verifyMediaTimingCancellation() {

@@ -1,7 +1,10 @@
 import AppKit
 import QuartzCore
 
-/// Decoded as a unit so the mask and its ink outline never advance independently.
+/// One transition phase is decoded as a unit so its mask and ink stay aligned.
+/// Hide is decoded when the ActiveScene starts and released after that wipe.
+/// Reveal is decoded only when the movie is near its end, so a long movie does
+/// not retain both frame sequences.
 final class TransitionFrames {
     struct Phase {
         let mask: [CGImage]
@@ -9,26 +12,19 @@ final class TransitionFrames {
         var duration: TimeInterval { Double(mask.count) / TransitionSequence.framesPerSecond }
     }
 
-    struct Pair {
-        let hide: Phase
-        let reveal: Phase
-    }
-
-    private final class CachedPair {
-        let pair: Pair
+    private final class CachedPhase {
+        let phase: Phase
         let cost: Int
-
-        init(_ pair: Pair) {
-            self.pair = pair
-            cost = [pair.hide.mask, pair.hide.outline.map(\.image), pair.reveal.mask, pair.reveal.outline.map(\.image)]
-                .joined().reduce(0) { $0 + $1.bytesPerRow * $1.height }
+        init(_ phase: Phase) {
+            self.phase = phase
+            cost = (phase.mask + phase.outline.map(\.image)).reduce(0) { $0 + FrameDecoder.imageCost($1) }
         }
     }
 
-    private static let cache: NSCache<NSString, CachedPair> = {
-        let cache = NSCache<NSString, CachedPair>()
-        cache.countLimit = 1
-        cache.totalCostLimit = 192 * 1024 * 1024
+    private static let cache: NSCache<NSString, CachedPhase> = {
+        let cache = NSCache<NSString, CachedPhase>()
+        cache.countLimit = 2
+        cache.totalCostLimit = 96 * 1024 * 1024
         return cache
     }()
 
@@ -40,55 +36,152 @@ final class TransitionFrames {
         return queue
     }()
 
-    private let operation = BlockOperation()
-    private var callbacks: [(Pair?) -> Void] = []
-    private var finished = false
-    private var result: Pair?
+    private let hideSequence: TransitionSequence?
+    private let revealSequence: TransitionSequence?
+    private let outlineSize: Int
+    private let cachePrefix: String
+    private var hidePhase: Phase?
+    private var revealPhase: Phase?
+    private var hideFinished = false
+    private var revealFinished = false
+    private var hideDiscarded = false
+    private var hideCallbacks: [(Phase?) -> Void] = []
+    private var revealCallbacks: [(Phase?) -> Void] = []
+    private var hideOperation: BlockOperation?
+    private var revealOperation: BlockOperation?
 
     init(choice: TransitionChoice, pixelWidth: CGFloat) {
-        let hide = choice.hide
-        let reveal = choice.reveal
-        // Give the visible ink a separate pixel budget. Thin strokes can be
-        // cropped without changing their position or their sampling density.
-        let outlineSize = Int(min(1536, max(512, pixelWidth)))
-        let key = [hide.mask.directoryURL.path, reveal.mask.directoryURL.path, String(outlineSize)]
-            .joined(separator: "|") as NSString
-        if let cached = Self.cache.object(forKey: key) {
-            result = cached.pair
-            finished = true
+        hideSequence = choice.hide
+        revealSequence = choice.reveal
+        outlineSize = Int(min(1536, max(512, pixelWidth)))
+        cachePrefix = [choice.hide.mask.directoryURL.path, choice.reveal.mask.directoryURL.path, String(outlineSize)]
+            .joined(separator: "|")
+        if let cached = Self.cache.object(forKey: cacheKey(.hide)) {
+            hidePhase = cached.phase
+            hideFinished = true
+        } else {
+            startDecode(.hide)
+        }
+    }
+
+    init(testingHide hide: Phase, reveal: Phase?) {
+        hideSequence = nil
+        revealSequence = nil
+        outlineSize = 0
+        cachePrefix = "test-\(UUID().uuidString)"
+        hidePhase = hide
+        revealPhase = reveal
+        hideFinished = true
+        revealFinished = reveal != nil
+    }
+
+    deinit {
+        hideOperation?.cancel()
+        revealOperation?.cancel()
+        Self.cache.removeObject(forKey: cacheKey(.hide))
+        Self.cache.removeObject(forKey: cacheKey(.reveal))
+    }
+
+    var debugHideFrameCount: Int { hidePhase?.mask.count ?? 0 }
+    var debugRevealFrameCount: Int { revealPhase?.mask.count ?? 0 }
+
+    static func purgeCache() { cache.removeAllObjects() }
+
+    func prepareReveal() {
+        guard revealOperation == nil, !revealFinished else { return }
+        if let cached = Self.cache.object(forKey: cacheKey(.reveal)) {
+            revealPhase = cached.phase
+            revealFinished = true
+            deliver(.reveal)
             return
         }
+        startDecode(.reveal)
+    }
+
+    func whenReady(
+        _ direction: TransitionAnimator.Direction,
+        _ callback: @escaping (Phase?) -> Void
+    ) {
+        if direction == .reveal { prepareReveal() }
+        if isFinished(direction) {
+            callback(phase(direction))
+            return
+        }
+        switch direction {
+        case .hide: hideCallbacks.append(callback)
+        case .reveal: revealCallbacks.append(callback)
+        }
+    }
+
+    func releaseHideFrames() {
+        hideDiscarded = true
+        hidePhase = nil
+        Self.cache.removeObject(forKey: cacheKey(.hide))
+    }
+
+    private func cacheKey(_ direction: TransitionAnimator.Direction) -> NSString {
+        "\(cachePrefix)|\(direction.rawValue)" as NSString
+    }
+
+    private func isFinished(_ direction: TransitionAnimator.Direction) -> Bool {
+        direction == .hide ? hideFinished : revealFinished
+    }
+
+    private func phase(_ direction: TransitionAnimator.Direction) -> Phase? {
+        let value = direction == .hide ? hidePhase : revealPhase
+        guard let value, !value.mask.isEmpty, value.mask.count == value.outline.count else { return nil }
+        return value
+    }
+
+    private func startDecode(_ direction: TransitionAnimator.Direction) {
+        guard let sequence = direction == .hide ? hideSequence : revealSequence else { return }
+        let operation = BlockOperation()
+        if direction == .hide { hideOperation = operation } else { revealOperation = operation }
+        let pixelSize = outlineSize
         operation.addExecutionBlock { [weak self, weak operation] in
             guard let operation else { return }
-            let result = Self.decodePair(hide: hide, reveal: reveal, pixelSize: outlineSize, operation: operation)
+            let phase = Self.decode(sequence, pixelSize: pixelSize, operation: operation)
             guard !operation.isCancelled else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if let result {
-                    let cached = CachedPair(result)
-                    Self.cache.setObject(cached, forKey: key, cost: cached.cost)
-                }
-                self.complete(result)
+                self?.store(phase, direction: direction)
             }
         }
         Self.queue.addOperation(operation)
     }
 
-    deinit { operation.cancel() }
-
-    static func purgeCache() { cache.removeAllObjects() }
-
-    func whenReady(_ callback: @escaping (Pair?) -> Void) {
-        if finished { callback(result) }
-        else { callbacks.append(callback) }
+    private func store(_ phase: Phase?, direction: TransitionAnimator.Direction) {
+        if direction == .hide && hideDiscarded {
+            hideFinished = true
+            deliver(.hide)
+            return
+        }
+        switch direction {
+        case .hide:
+            hidePhase = phase
+            hideFinished = true
+        case .reveal:
+            revealPhase = phase
+            revealFinished = true
+        }
+        if let phase {
+            let cached = CachedPhase(phase)
+            Self.cache.setObject(cached, forKey: cacheKey(direction), cost: cached.cost)
+        }
+        deliver(direction)
     }
 
-    private func complete(_ pair: Pair?) {
-        result = pair
-        finished = true
-        let pending = callbacks
-        callbacks.removeAll()
-        pending.forEach { $0(pair) }
+    private func deliver(_ direction: TransitionAnimator.Direction) {
+        let pending: [(Phase?) -> Void]
+        switch direction {
+        case .hide:
+            pending = hideCallbacks
+            hideCallbacks.removeAll()
+        case .reveal:
+            pending = revealCallbacks
+            revealCallbacks.removeAll()
+        }
+        let value = phase(direction)
+        pending.forEach { $0(value) }
     }
 
     private static func decode(
@@ -109,24 +202,8 @@ final class TransitionFrames {
             masks.append(mask)
             outlines.append(outline)
         }
+        guard !masks.isEmpty, masks.count == outlines.count else { return nil }
         return Phase(mask: masks, outline: outlines)
-    }
-
-    private static func decodePair(
-        hide: TransitionSequence, reveal: TransitionSequence, pixelSize: Int, operation: Operation
-    ) -> Pair? {
-        let sequences = [hide, reveal]
-        let lock = NSLock()
-        var phases: [Phase?] = [nil, nil]
-        // One pair is decoded at a time; the two phases are independent.
-        DispatchQueue.concurrentPerform(iterations: sequences.count) { index in
-            let phase = decode(sequences[index], pixelSize: pixelSize, operation: operation)
-            lock.lock()
-            phases[index] = phase
-            lock.unlock()
-        }
-        guard let hide = phases[0], let reveal = phases[1] else { return nil }
-        return Pair(hide: hide, reveal: reveal)
     }
 }
 
@@ -176,16 +253,15 @@ final class TransitionAnimator {
         }
         work = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timeout)
-        frames.whenReady { [weak self] pair in
+        frames.whenReady(direction) { [weak self] phase in
             guard let self, self.active, !self.started else { return }
             self.work?.cancel()
-            guard let pair else {
+            guard let phase else {
                 NSLog("Snoopy transition frames missing or unreadable; using dissolve")
                 self.dissolve(onStart: onStart, completion: completion)
                 return
             }
             self.started = true
-            let phase = direction == .hide ? pair.hide : pair.reveal
             let top = direction == .hide ? outgoing : self.incoming
             let bottom = direction == .hide ? self.incoming : outgoing
             CATransaction.begin(); CATransaction.setDisableActions(true)

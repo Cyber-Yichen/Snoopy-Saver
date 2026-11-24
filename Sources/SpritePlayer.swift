@@ -81,7 +81,7 @@ final class FrameDecoder {
         let cost: Int
         init(_ frame: SpriteRaster) {
             self.frame = frame
-            cost = frame.image.bytesPerRow * frame.image.height
+            cost = FrameDecoder.imageCost(frame.image)
         }
     }
 
@@ -215,6 +215,11 @@ final class FrameDecoder {
         }
     }
 
+    static func imageCost(_ image: CGImage) -> Int {
+        let row = image.bytesPerRow > 0 ? image.bytesPerRow : image.width * 4
+        return max(1, row * max(image.height, 1))
+    }
+
     static func decodeImage(_ url: URL, maxPixelSize: Int) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(
             url as CFURL,
@@ -298,6 +303,23 @@ final class SpriteAssetPlayer {
     }
 
     deinit { stop() }
+
+    static let sharpLoopWindow = 8
+
+    /// Frames kept for a sharp looping pose: the visible frame plus the
+    /// existing prefetch depth. The displayed image stays at display
+    /// resolution; older frames are not pinned for the whole loop.
+    static func retentionWindow(current: Int, start: Int, count: Int, limit: Int) -> Set<Int> {
+        guard count > 0, limit > 0 else { return [current] }
+        let span = min(limit, count)
+        let raw = (current - start) % count
+        let local = raw >= 0 ? raw : raw + count
+        var keys = Set<Int>()
+        for offset in 0..<span {
+            keys.insert(start + (local + offset) % count)
+        }
+        return keys
+    }
 
     static func purgeCaches() { FrameDecoder.shared.removeAll() }
 
@@ -695,7 +717,7 @@ final class SpriteAssetPlayer {
 
         if let image = loopImages[frameNumber]
             ?? FrameDecoder.shared.cachedFrame(for: url, maxPixelSize: pixelSize, trim: sharpBasePose) {
-            if descriptor.loops { loopImages[frameNumber] = image }
+            storeLoopFrame(frameNumber, image: image, descriptor: descriptor, pixelSize: pixelSize)
             installFrame(
                 image,
                 key: key,
@@ -716,8 +738,8 @@ final class SpriteAssetPlayer {
             guard let self, let layer, self.frameGeneration == generation else { return }
             if self.pendingFrameKey == key { self.pendingFrameKey = nil }
             guard let image, self.isPlaying else { return }
-            if descriptor.loops, self.loopPixelSize == pixelSize { self.loopImages[frameNumber] = image }
             guard self.desiredFrameKey == key else { return }
+            self.storeLoopFrame(frameNumber, image: image, descriptor: descriptor, pixelSize: pixelSize)
             self.installFrame(
                 image,
                 key: key,
@@ -726,6 +748,24 @@ final class SpriteAssetPlayer {
                 completion: firstFrameCompletion
             )
         }
+    }
+
+    private func storeLoopFrame(
+        _ frame: Int,
+        image: SpriteRaster,
+        descriptor: SpriteDescriptor,
+        pixelSize: Int
+    ) {
+        guard descriptor.loops, loopPixelSize == pixelSize else { return }
+        loopImages[frame] = image
+        guard sharpBasePose else { return }
+        let keep = Self.retentionWindow(
+            current: frame,
+            start: descriptor.startFrame,
+            count: descriptor.frameCount,
+            limit: Self.sharpLoopWindow
+        )
+        loopImages = loopImages.filter { keep.contains($0.key) }
     }
 
     private func installFrame(
