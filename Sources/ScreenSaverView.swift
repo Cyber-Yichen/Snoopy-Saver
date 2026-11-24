@@ -41,6 +41,9 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     private var retiringActive: ActivePlayback?
     private var retiringIdle: IdleScenePlayback?
     private var generation = 0
+    /// Bumped when a scene change commits or the session stops. Deferred
+    /// end-of-movie callbacks captured the previous value and then no-op.
+    private var playbackEpoch = 0
     private var lastTransitionPairID: String?
     // Local policy until the official consecutive-transition limit is verified.
     private static let maxConsecutivePreservedIdleScenes = 2
@@ -192,6 +195,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             incoming = next
         }
         let preservesIdle = oldActive?.preservedIdle != nil
+        playbackEpoch += 1
         retireCurrentScene()
         incoming.container.opacity = 0
         idle = incoming; root.addSublayer(incoming.container); incoming.prepare(); incoming.tick()
@@ -234,6 +238,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             return
         }
         preparedIdle?.stop(); preparedIdle = nil
+        playbackEpoch += 1
         let oldIdle = idleStarted ? idle : (activeStarted ? nil : retiringIdle)
         let choice = catalog.transitionChoice(
             for: scene, environment: environment.snapshot(), scorer: scorer,
@@ -380,8 +385,18 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             guard let self, let player, self.active?.player === player else { return }
             let remaining = max(0, total - player.currentTime().seconds)
             NSLog("Snoopy begins transition with %.2fs remaining", remaining)
-            self.prepareIdleForActiveExit()
-            self.playIdle()
+            let capturedEpoch = self.playbackEpoch
+            SceneAdvance.deferBoundaryAdvance(
+                sessionActive: { [weak self] in self?.sessionActive == true },
+                epoch: { [weak self] in self?.playbackEpoch ?? -1 },
+                capturedEpoch: capturedEpoch,
+                playerStillCurrent: { [weak self] in self?.active?.player === player },
+                advance: { [weak self] in
+                    guard let self else { return }
+                    self.prepareIdleForActiveExit()
+                    self.playIdle()
+                }
+            )
         }
         activeTimeObservers.append((playback.player, transitionToken))
     }
@@ -507,6 +522,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         }
         sessionActive = false
         generation += 1
+        playbackEpoch += 1
         transition?.cancel(); transition = nil
         removeObservers()
         watchdog?.cancel(); watchdog = nil
