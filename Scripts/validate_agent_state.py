@@ -20,6 +20,7 @@ state_path = root / ".agents" / "project-state.json"
 info_path = root / "Info.plist"
 build_path = root / "Scripts" / "build_saver.sh"
 screen_saver_view_path = root / "Sources" / "ScreenSaverView.swift"
+environment_path = root / "Sources" / "Environment.swift"
 
 try:
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -27,6 +28,7 @@ try:
         info = plistlib.load(stream)
     build_script = build_path.read_text(encoding="utf-8")
     screen_saver_view = screen_saver_view_path.read_text(encoding="utf-8")
+    environment_source = environment_path.read_text(encoding="utf-8")
 except (OSError, json.JSONDecodeError, plistlib.InvalidFileException) as error:
     fail(str(error))
 
@@ -94,5 +96,24 @@ idle_range = frozen["idleDurationSeconds"]
 idle_expression = f'Double.random(in: {idle_range["minimum"]}...{idle_range["maximum"]})'
 if screen_saver_view.count(idle_expression) < 2:
     fail("ScreenSaverView does not consistently implement the declared Idle duration range")
+
+environment_io = frozen.get("environmentIO")
+expected_environment_io = {
+    "default": "offline",
+    "locationAuthorization": "never",
+    "network": "explicit-opt-in",
+    "fallbackCoordinates": False,
+    "defaultsSuite": "local.snoopy.ScreenSaver",
+    "killSwitch": "SNOOPY_DISABLE_ENVIRONMENT_IO",
+}
+if environment_io != expected_environment_io:
+    fail("environment IO contract does not match the explicit weather opt-in")
+if "NSLocationWhenInUseUsageDescription" in info:
+    fail("Info.plist must not advertise location use; the saver does not request it")
+for banned in ("CLLocationManager", "requestWhenInUseAuthorization", "fallbackLocation"):
+    if banned in environment_source:
+        fail(f"Environment.swift still contains {banned}")
+if "WeatherAccess.request" not in environment_source:
+    fail("weather fetches must go through the explicit WeatherAccess request")
 
 print("Agent state contract passed: standard bundle and product metadata agree.")

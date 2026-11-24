@@ -1,4 +1,3 @@
-import CoreLocation
 import Foundation
 
 enum EventCalendar {
@@ -80,23 +79,61 @@ enum LunarPhase {
     }
 }
 
-final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
+enum WeatherAccess {
+    static let suiteName = "local.snoopy.ScreenSaver"
+    static let enabledKey = "SnoopyWeatherEnabled"
+    static let latitudeKey = "SnoopyWeatherLatitude"
+    static let longitudeKey = "SnoopyWeatherLongitude"
+    static let cacheKey = "SnoopyWeatherCache.v3"
+    static let disableEnvironmentKey = "SNOOPY_DISABLE_ENVIRONMENT_IO"
+
+    struct Request: Equatable {
+        var latitude: Double
+        var longitude: Double
+    }
+
+    static func request(defaults: UserDefaults, environment: [String: String]) -> Request? {
+        // The saver runs inside another process and must not ask that host
+        // for location permission. Missing or out-of-range coordinates stay
+        // offline; preset city coordinates are not used.
+        if environment[disableEnvironmentKey] == "1" { return nil }
+        guard defaults.bool(forKey: enabledKey) else { return nil }
+        guard let latitude = coordinate(defaults, latitudeKey),
+              let longitude = coordinate(defaults, longitudeKey),
+              (-90...90).contains(latitude),
+              (-180...180).contains(longitude) else { return nil }
+        return Request(latitude: latitude, longitude: longitude)
+    }
+
+    static func sharedDefaults() -> UserDefaults {
+        UserDefaults(suiteName: suiteName) ?? .standard
+    }
+
+    private static func coordinate(_ defaults: UserDefaults, _ key: String) -> Double? {
+        guard let number = defaults.object(forKey: key) as? NSNumber else { return nil }
+        let value = number.doubleValue
+        return value.isFinite ? value : nil
+    }
+}
+
+final class EnvironmentProvider {
     var onUpdate: (() -> Void)?
-    private let manager = CLLocationManager()
+    private(set) var didAttemptWeatherFetch = false
     private var cache: WeatherCache?
     private var lastAttempt = Date.distantPast
     private var requestID: UUID?
     private var running = false
     private var session: URLSession?
-    private let locationIOEnabled = ProcessInfo.processInfo.environment["SNOOPY_DISABLE_ENVIRONMENT_IO"] != "1"
+    private let defaults: UserDefaults
+    private let processEnvironment: [String: String]
 
-    override init() {
-        super.init()
-        if locationIOEnabled {
-            manager.delegate = self
-            manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
-        }
-        if locationIOEnabled, let data = UserDefaults.standard.data(forKey: "SnoopyWeatherCache.v3") {
+    init(
+        defaults: UserDefaults = WeatherAccess.sharedDefaults(),
+        processEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        self.defaults = defaults
+        self.processEnvironment = processEnvironment
+        if let data = defaults.data(forKey: WeatherAccess.cacheKey) {
             cache = try? JSONDecoder().decode(WeatherCache.self, from: data)
         }
     }
@@ -104,24 +141,23 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     func stop() {
         running = false
         requestID = nil
-        manager.stopUpdatingLocation()
         session?.invalidateAndCancel(); session = nil
     }
     func start() {
         running = true
         onUpdate?()
-        guard locationIOEnabled else { return }
-        if manager.authorizationStatus == .notDetermined { manager.requestWhenInUseAuthorization() }
-        else { refreshIfNeeded() }
+        refreshIfNeeded()
     }
     func refreshIfNeeded() {
         let now = Date()
-        guard running, locationIOEnabled, requestID == nil, manager.authorizationStatus != .notDetermined,
+        guard running, requestID == nil, let request = weatherRequest(),
               Self.shouldRefresh(at: now, fetchedAt: cache?.fetchedAt, lastAttempt: lastAttempt) else { return }
         lastAttempt = now
-        if manager.authorizationStatus == .authorized || manager.authorizationStatus == .authorizedAlways {
-            manager.requestLocation()
-        } else { fetch(fallbackLocation()) }
+        fetch(request)
+    }
+
+    private func weatherRequest() -> WeatherAccess.Request? {
+        WeatherAccess.request(defaults: defaults, environment: processEnvironment)
     }
 
     static func shouldRefresh(at now: Date, fetchedAt: Date?, lastAttempt: Date) -> Bool {
@@ -132,7 +168,9 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
         return !(0..<30 * 60).contains(fetchedAge) && !(0..<5 * 60).contains(retryAge)
     }
     func snapshot(at date: Date = Date()) -> EnvironmentSnapshot {
-        Self.snapshot(at: date, cachedWeather: cache)
+        // Calendar, routine, and lunar phase stay active offline. Cached
+        // weather must not leak into selection after the opt-in is absent.
+        Self.snapshot(at: date, cachedWeather: weatherRequest() == nil ? nil : cache)
     }
 
     static func snapshot(at date: Date, cachedWeather: WeatherCache?) -> EnvironmentSnapshot {
@@ -151,20 +189,13 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
         return EnvironmentSnapshot(date: date, facts: facts, previousWeather: cache?.previous,
                                    sunrise: cache?.sunrise, sunset: cache?.sunset)
     }
-    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        refreshIfNeeded()
-    }
-    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        if let location = locations.last { fetch(location) }
-    }
-    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) { fetch(fallbackLocation()) }
-
-    private func fetch(_ location: CLLocation) {
+    private func fetch(_ request: WeatherAccess.Request) {
+        didAttemptWeatherFetch = true
         guard running, requestID == nil,
               var c = URLComponents(string: "https://api.open-meteo.com/v1/forecast") else { return }
         c.queryItems = [
-            .init(name:"latitude", value:String(format:"%.2f", location.coordinate.latitude)),
-            .init(name:"longitude", value:String(format:"%.2f", location.coordinate.longitude)),
+            .init(name:"latitude", value:String(format:"%.2f", request.latitude)),
+            .init(name:"longitude", value:String(format:"%.2f", request.longitude)),
             .init(name:"current", value:"weather_code,is_day,temperature_2m,wind_speed_10m"),
             .init(name:"daily", value:"weather_code,sunrise,sunset"), .init(name:"past_days", value:"1"),
             .init(name:"forecast_days", value:"1"), .init(name:"timezone", value:"auto"),
@@ -206,7 +237,7 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
                 guard let self, self.requestID == expected else { return }
                 self.requestID = nil; self.cache = value
                 if let encoded = try? JSONEncoder().encode(value) {
-                    UserDefaults.standard.set(encoded, forKey: "SnoopyWeatherCache.v3")
+                    self.defaults.set(encoded, forKey: WeatherAccess.cacheKey)
                 }
                 self.onUpdate?()
             }
@@ -222,14 +253,6 @@ final class EnvironmentProvider: NSObject, CLLocationManagerDelegate {
     private static func date(_ value: String, in timeZone: TimeZone) -> Date? {
         let f = DateFormatter(); f.locale = Locale(identifier:"en_US_POSIX"); f.timeZone = timeZone; f.dateFormat = "yyyy-MM-dd'T'HH:mm"
         return f.date(from: value)
-    }
-    private func fallbackLocation() -> CLLocation {
-        let id = TimeZone.current.identifier
-        if id.hasPrefix("Asia/Shanghai") { return CLLocation(latitude:31.2304, longitude:121.4737) }
-        if id.hasPrefix("Asia/Tokyo") { return CLLocation(latitude:35.6762, longitude:139.6503) }
-        if id.hasPrefix("Europe/") { return CLLocation(latitude:48.8566, longitude:2.3522) }
-        if id.hasPrefix("America/New_York") { return CLLocation(latitude:40.7128, longitude:-74.0060) }
-        return CLLocation(latitude:37.3349, longitude:-122.0090)
     }
 }
 

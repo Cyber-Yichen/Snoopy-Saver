@@ -87,7 +87,7 @@ flowchart TD
 - Swift 5, AppKit, and `ScreenSaver.framework`
 - AVFoundation for full-screen movies, phased actions, and preloading
 - Core Animation for layer composition, masks, and transitions
-- Core Location + Open-Meteo for optional weather, sunrise, and sunset matching
+- Open-Meteo for optional weather, sunrise, and sunset matching after an explicit opt-in. Offline by default, with no location prompt
 - ImageIO for HEIC sequence decoding with a bounded cache
 - Shell scripts for universal builds and installation helpers
 
@@ -127,9 +127,25 @@ Pre-release validation includes:
 - AddressSanitizer playback and layer-handoff tests;
 - 12 forced scene changes without a crash, black frame, or layer accumulation;
 - a 192 MB HEIC cache limit, purged when the saver stops;
-- explicit cleanup for players, prerolls, notifications, KVO, time observers, location, and network sessions;
+- explicit cleanup for players, prerolls, notifications, KVO, and time observers when playback stops; no location prompt and no weather network by default;
 - no external process execution, third-party binary, or executable resource at runtime;
-- HTTPS-only Open-Meteo requests through an ephemeral, cookie-free, disk-cache-free session with timeouts and a response-size limit.
+- HTTPS Open-Meteo requests only after `local.snoopy.ScreenSaver` preferences explicitly enable weather and provide coordinates. The session is ephemeral, cookie-free, and disk-cache-free, with timeouts and a response-size limit. Preset city coordinates are never sent.
+
+### Weather (off by default)
+
+Date, time, holidays, routine, and lunar phase always participate in selection. Weather, sunrise, and sunset do not unless explicitly enabled. The saver has no configure sheet and does not ask the host process for location authorization.
+
+```bash
+defaults write local.snoopy.ScreenSaver SnoopyWeatherEnabled -bool true
+defaults write local.snoopy.ScreenSaver SnoopyWeatherLatitude -float 31.23
+defaults write local.snoopy.ScreenSaver SnoopyWeatherLongitude -float 121.47
+```
+
+Replace the sample coordinates with your own. A missing or out-of-range coordinate, or `SNOOPY_DISABLE_ENVIRONMENT_IO=1`, suppresses the request. Turn weather off with:
+
+```bash
+defaults write local.snoopy.ScreenSaver SnoopyWeatherEnabled -bool false
+```
 
 Measured resident memory was about 295 MB at baseline and about 568 MB while overlapping two 4K scenes during a transition. All root layers were removed after stopping. Results vary by media, resolution, and macOS version.
 

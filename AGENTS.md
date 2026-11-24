@@ -46,7 +46,7 @@ Unless the current user explicitly asks to change one of these behaviors:
 - The standard saver plays bundled media. There are no separate 1080p or CDN download builds.
 - IdleScene preserves alpha, palette background, halftone overlay, character/visitor planes, continuous phase playback, and aspect-ratio-safe layout.
 - ActiveScene/IdleScene transitions retain the official five styles where metadata covers them and use dissolve only as fallback.
-- Date, routine, weather, recency/frequency decay, and highest-score tie randomization remain part of selection.
+- Date, routine, weather, recency/frequency decay, and highest-score tie randomization remain part of selection. Weather, sunrise, and sunset are used only after an explicit opt-in that supplies coordinates in the `local.snoopy.ScreenSaver` defaults suite. The saver does not request Core Location authorization and does not send preset city coordinates. `SNOOPY_DISABLE_ENVIRONMENT_IO=1` forces that network off.
 - Do not collapse multi-layer IdleScene into a precomposited flat video.
 
 ## 5. Bundle identity contract

@@ -87,7 +87,7 @@ flowchart TD
 - Swift 5、AppKit 与 `ScreenSaver.framework`
 - AVFoundation：全屏视频、分段动作和预加载
 - Core Animation：多图层合成、蒙版和转场
-- Core Location + Open-Meteo：可选的天气、日出和日落匹配
+- 显式开启后的 Open-Meteo：可选的天气、日出和日落匹配。默认离线，不申请定位
 - ImageIO：HEIC 序列解码与受限缓存
 - Shell：通用架构构建和安装辅助
 
@@ -127,9 +127,25 @@ Scripts/install_saver.sh
 - AddressSanitizer 播放与图层交接测试通过；
 - 12 次连续强制场景切换无崩溃、黑屏或图层累积；
 - HEIC 缓存限制为 192 MB，并在屏保停止时主动清空；
-- 播放器、预加载、通知、KVO、时间观察器、定位和网络会话均显式清理；
+- 播放器、预加载、通知、KVO 和时间观察器在停止时清理；默认不申请定位、不打开天气网络；
 - 运行时代码不执行外部命令，不包含第三方二进制或可执行资源；
-- 天气请求仅通过 HTTPS 访问 Open-Meteo，并使用无 Cookie、无磁盘缓存、带超时和响应大小限制的临时会话。
+- 只有在本机 `local.snoopy.ScreenSaver` 偏好里显式打开天气并写入坐标后，才通过 HTTPS 访问 Open-Meteo。会话无 Cookie、无磁盘缓存，带超时和响应大小限制。不会发送预设城市坐标。
+
+### 天气（默认关闭）
+
+日期、时间、节日、作息和月相始终参与选片。天气、日出和日落默认不参与，屏保也不会向系统申请定位权限。这个包没有配置面板；开关是偏好域 `local.snoopy.ScreenSaver`，因为屏保运行在 `legacyScreenSaver` 或系统设置进程里，不能安全地弹出定位授权。
+
+```bash
+defaults write local.snoopy.ScreenSaver SnoopyWeatherEnabled -bool true
+defaults write local.snoopy.ScreenSaver SnoopyWeatherLatitude -float 31.23
+defaults write local.snoopy.ScreenSaver SnoopyWeatherLongitude -float 121.47
+```
+
+把纬度、经度换成你自己的坐标。缺少坐标、坐标超出范围，或设置了 `SNOOPY_DISABLE_ENVIRONMENT_IO=1` 时，都不会发起请求。关闭天气：
+
+```bash
+defaults write local.snoopy.ScreenSaver SnoopyWeatherEnabled -bool false
+```
 
 测试中的常驻内存约为 295 MB，4K 双场景转场峰值约为 568 MB；停止后所有根图层均清空。不同素材、分辨率和 macOS 版本会产生不同结果。
 

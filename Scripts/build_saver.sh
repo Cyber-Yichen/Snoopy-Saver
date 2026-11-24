@@ -41,8 +41,8 @@ for ARCH in arm64 x86_64; do
     "$ROOT"/Sources/*.swift -o "$STAGING/$ARCH/SnoopyScreenSaver.o"
   xcrun clang -target "$ARCH-apple-macosx12.0" -isysroot "$SDK" -bundle \
     "$STAGING/$ARCH/SnoopyScreenSaver.o" -L"$SDK/usr/lib/swift" -L/usr/lib/swift -L"$SWIFT_LIB" \
-    -lswiftCore -lswiftFoundation -lswiftAppKit -lswiftAVFoundation -lswiftCoreLocation \
-    -framework AppKit -framework AVFoundation -framework CoreLocation -framework ImageIO \
+    -lswiftCore -lswiftFoundation -lswiftAppKit -lswiftAVFoundation \
+    -framework AppKit -framework AVFoundation -framework ImageIO \
     -framework QuartzCore -framework ScreenSaver -o "$STAGING/$ARCH/SnoopyScreenSaver"
 done
 xcrun lipo -create "$STAGING/arm64/SnoopyScreenSaver" "$STAGING/x86_64/SnoopyScreenSaver" \
