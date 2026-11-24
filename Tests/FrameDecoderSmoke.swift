@@ -23,6 +23,7 @@ struct FrameDecoderSmoke {
         verifyMediaTimingFallbackRemoved()
         verifyMediaTimingCancellation()
         verifyFrameRetention()
+        verifySuspendedClock()
         try verifyNaturalBoundaryAdvance()
         print("Frame decoder smoke passed: in-flight and queued cancellation, trimmed raster placement, opaque dissolve, and deferred end-of-movie advance.")
         if CommandLine.arguments.count == 2 {
@@ -372,6 +373,20 @@ struct FrameDecoderSmoke {
         frames.releaseHideFrames()
         precondition(frames.debugHideFrameCount == 0, "hide frames stayed resident after the wipe")
         precondition(frames.debugRevealFrameCount == 1, "releasing hide dropped the reveal phase")
+    }
+
+    private static func verifySuspendedClock() {
+        let pauseBegan: CFTimeInterval = 100
+        let resumedAt: CFTimeInterval = 130
+        precondition(SpriteAssetPlayer.resumedFrameStart(
+            frameStarted: 90, pauseBegan: pauseBegan, resumedAt: resumedAt
+        ) == 120)
+        precondition(SpriteAssetPlayer.resumedFrameStart(
+            frameStarted: 0, pauseBegan: pauseBegan, resumedAt: resumedAt
+        ) == 0)
+        precondition(SpriteAssetPlayer.shiftedFireTime(
+            fireAt: pauseBegan + 1.5, pauseBegan: pauseBegan, resumedAt: resumedAt
+        ) == resumedAt + 1.5)
     }
 
     private static func verifyMediaTimingCancellation() {

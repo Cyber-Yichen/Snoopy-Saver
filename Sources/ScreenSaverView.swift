@@ -223,6 +223,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         retireCurrentScene()
         incoming.container.opacity = 0
         idle = incoming; root.addSublayer(incoming.container); incoming.prepare(); incoming.tick()
+        if resourcesSuspended { incoming.setResourcesPaused(true) }
         incoming.onFinished = { [weak self, weak incoming] in
             guard let self, let incoming, self.idle === incoming, self.sessionActive else { return }
             self.playActive()
@@ -242,6 +243,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             }) { [weak self, weak incoming] in
                 guard let self, let incoming, self.idle === incoming else { return }
                 self.finishTransition()
+                if self.resourcesSuspended { incoming.setResourcesPaused(true) }
                 incoming.start(firstScene: !self.didStartIdleScene)
                 self.didStartIdleScene = true
             }
@@ -292,6 +294,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             transitionChoice: choice, transitionFrames: transitionFrames, preservedIdle: preservedIdle
         )
         active = playback; revealedPlayerID = nil
+        if resourcesSuspended { resumeActivePlayback = false }
         installObservers(item, playback: playback)
         lastTransitionPairID = choice?.pairID
         let reveal = { [weak self, weak player] in
@@ -313,7 +316,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
                 }
                 self.activeStarted = true
                 self.installActiveExitSchedule(item: item, playback: playback)
-                player.play()
+                self.playActiveMovie(player)
             }) { [weak self, weak player] in
                 guard let self, let player, self.active?.player === player else { return }
                 self.active?.transitionFrames?.releaseHideFrames()
@@ -355,7 +358,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
                     self.playIdle()
                 } else if item.status == .readyToPlay, !primingStarted {
                     if video.isReadyForDisplay { prepareReveal() }
-                    else { player.play() }
+                    else { self.playActiveMovie(player) }
                 }
             }
         }
@@ -435,6 +438,7 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         let duration = Double.random(in: 20...60)
         guard let incoming = makeIdlePlayback(preserving: active?.preservedIdle, duration: duration) else { return }
         incoming.prepare(); incoming.tick()
+        if resourcesSuspended { incoming.setResourcesPaused(true) }
         preparedIdle = incoming
     }
 
@@ -681,6 +685,18 @@ final class SnoopyScreenSaverView: ScreenSaverView {
             resumeActivePlayback = false
             resumeRetiringPlayback = false
         }
+    }
+
+    /// Playback that becomes ready while the window is already offscreen must
+    /// not call `play()` immediately. The suspension flag is sticky, so a later
+    /// visibility notification will not pause a player started after it.
+    private func playActiveMovie(_ player: AVPlayer) {
+        guard !resourcesSuspended else {
+            resumeActivePlayback = true
+            player.pause()
+            return
+        }
+        player.play()
     }
 
     private func activationKey() -> String? {
