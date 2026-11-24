@@ -255,6 +255,7 @@ final class SpriteAssetPlayer {
     private var sharpBasePose = false
     private var decoderClientID = UUID()
     private var resourcesPaused = false
+    private var mediaCancel = CancelFlag()
     private var frameURLs: [String: URL] = [:]
     private(set) var isPlaying = false
     var debugLayerCount: Int { layers.count }
@@ -289,8 +290,7 @@ final class SpriteAssetPlayer {
     }
 
     private static func mediaDuration(_ url: URL) -> TimeInterval? {
-        let value = AVURLAsset(url: url).duration.seconds
-        return value.isFinite && value > 0 ? value : nil
+        MediaTimingCache.shared.duration(for: url)
     }
 
     init(host: CALayer, sceneOffset: CGPoint, hostBounds: @escaping () -> CGRect) {
@@ -323,7 +323,10 @@ final class SpriteAssetPlayer {
         // `play` resets any previous media but must preserve the readiness
         // callback the caller just installed for an atomic layer handoff.
         let readinessCallback = onReady
-        stop(); onReady = readinessCallback; isPlaying = true
+        stop()
+        mediaCancel = CancelFlag()
+        onReady = readinessCallback
+        isPlaying = true
         sharpBasePose = asset.kind == .characterBasePose
         let phased = asset.sprites.contains { $0.phase != .oneShot }
         if holdFirstVideoFrame {
@@ -376,6 +379,7 @@ final class SpriteAssetPlayer {
     }
 
     func stop() {
+        mediaCancel.cancel()
         isPlaying = false
         FrameDecoder.shared.cancelRequests(for: decoderClientID)
         decoderClientID = UUID()
@@ -413,55 +417,108 @@ final class SpriteAssetPlayer {
         targetDuration: TimeInterval,
         completion: (() -> Void)?
     ) {
-        guard let first = sprites.first, let firstURL = first.movieURL else { isPlaying = false; completion?(); return }
+        guard let first = sprites.first, first.movieURL != nil else { isPlaying = false; completion?(); return }
+        let cancel = mediaCancel
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let built = Self.makeSeamlessComposition(sprites, targetDuration: targetDuration, cancel: cancel)
+            DispatchQueue.main.async {
+                guard let self, self.isPlaying, self.mediaCancel === cancel, !cancel.isCancelled else { return }
+                guard let built else {
+                    self.isPlaying = false
+                    completion?()
+                    return
+                }
+                self.installSeamlessPlayer(built.composition, sprite: built.sprite, completion: completion)
+            }
+        }
+    }
+
+    private struct SeamlessBuild {
+        let composition: AVMutableComposition
+        let sprite: SpriteDescriptor
+    }
+
+    private static func makeSeamlessComposition(
+        _ sprites: [SpriteDescriptor],
+        targetDuration: TimeInterval,
+        cancel: CancelFlag
+    ) -> SeamlessBuild? {
+        if cancel.isCancelled { return nil }
         let intro = sprites.first { $0.phase == .intro }
         let loop = sprites.first { $0.phase == .loop }
         let outro = sprites.first { $0.phase == .outro }
-        let introDuration = intro.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0
-        let loopDuration = loop.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0.1
-        let outroDuration = outro.flatMap(\.movieURL).flatMap(Self.mediaDuration) ?? 0
-        let desiredLoop = max(loopDuration, targetDuration - introDuration - outroDuration)
-        let loopCount = max(1, Int((desiredLoop / loopDuration).rounded()))
-        var entries: [(SpriteDescriptor, URL)] = []
-        if let intro, let url = intro.movieURL { entries.append((intro, url)) }
-        if let loop, let url = loop.movieURL { for _ in 0..<loopCount { entries.append((loop, url)) } }
-        if let outro, let url = outro.movieURL { entries.append((outro, url)) }
-        if entries.isEmpty { entries = [(first, firstURL)] }
+        func loaded(_ sprite: SpriteDescriptor?) -> (asset: AVURLAsset, track: AVAssetTrack, duration: CMTime)? {
+            guard let sprite, let url = sprite.movieURL else { return nil }
+            return MediaTimingCache.loadSource(url, cancel: cancel)
+        }
+        let introSource = loaded(intro)
+        let loopSource = loaded(loop)
+        let outroSource = loaded(outro)
+        if intro != nil && introSource == nil { return nil }
+        if outro != nil && outroSource == nil { return nil }
+        guard let loop, let loopSource,
+              let loopDuration = MediaTiming.validatedDuration(seconds: loopSource.duration.seconds, loaded: true),
+              let loopCount = MediaTiming.loopRepeatCount(
+                loopDuration: loopDuration,
+                desiredLoop: max(loopDuration, targetDuration - (introSource?.duration.seconds ?? 0) - (outroSource?.duration.seconds ?? 0))
+              )
+        else { return nil }
+        var entries: [(SpriteDescriptor, AVURLAsset, AVAssetTrack, CMTime)] = []
+        if let intro, let introSource {
+            entries.append((intro, introSource.asset, introSource.track, introSource.duration))
+        }
+        for _ in 0..<loopCount {
+            entries.append((loop, loopSource.asset, loopSource.track, loopSource.duration))
+        }
+        if let outro, let outroSource {
+            entries.append((outro, outroSource.asset, outroSource.track, outroSource.duration))
+        }
+        guard !cancel.isCancelled else { return nil }
         let composition = AVMutableComposition()
         guard let compositionTrack = composition.addMutableTrack(
             withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid
-        ) else { isPlaying = false; completion?(); return }
+        ) else { return nil }
         var cursor = CMTime.zero
         var insertedAny = false
-        var sources: [URL: AVURLAsset] = [:]
-        for (_, url) in entries {
-            let sourceAsset = sources[url] ?? AVURLAsset(url: url)
-            sources[url] = sourceAsset
-            guard let sourceTrack = sourceAsset.tracks(withMediaType: .video).first else { continue }
-            let sourceDuration = sourceAsset.duration
-            guard sourceDuration.isValid, sourceDuration.seconds.isFinite, sourceDuration.seconds > 0 else { continue }
+        for entry in entries {
+            if cancel.isCancelled { return nil }
             do {
                 try compositionTrack.insertTimeRange(
-                    CMTimeRange(start: .zero, duration: sourceDuration), of: sourceTrack, at: cursor
+                    CMTimeRange(start: .zero, duration: entry.3), of: entry.2, at: cursor
                 )
-                if !insertedAny { compositionTrack.preferredTransform = sourceTrack.preferredTransform }
-                cursor = CMTimeAdd(cursor, sourceDuration); insertedAny = true
+                if !insertedAny,
+                   entry.2.statusOfValue(forKey: "preferredTransform", error: nil) == .loaded {
+                    compositionTrack.preferredTransform = entry.2.preferredTransform
+                }
+                cursor = CMTimeAdd(cursor, entry.3)
+                insertedAny = true
             } catch {
                 NSLog("Snoopy sprite composition error: %@", String(describing: error))
+                return nil
             }
         }
-        guard insertedAny else { isPlaying = false; completion?(); return }
+        guard insertedAny else { return nil }
+        return SeamlessBuild(composition: composition, sprite: entries[0].0)
+    }
+
+    private func installSeamlessPlayer(
+        _ composition: AVMutableComposition,
+        sprite: SpriteDescriptor,
+        completion: (() -> Void)?
+    ) {
         let item = AVPlayerItem(asset: composition)
         let player = AVPlayer(playerItem: item)
         PlayerPolicy.apply(player)
         let layer = AVPlayerLayer(player: player)
-        configure(layer, sprite: entries[0].0); layer.opacity = 0
+        configure(layer, sprite: sprite)
+        layer.opacity = 0
         players.append(player)
         observers.append(NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
             guard let self, self.isPlaying else { return }
-            self.isPlaying = false; completion?()
+            self.isPlaying = false
+            completion?()
         })
         observeReady(item, player: player, layer: layer)
     }

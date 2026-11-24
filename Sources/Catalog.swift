@@ -143,6 +143,18 @@ final class AssetCatalog {
 
     func assets(_ kind: AssetKind) -> [AssetRecord] { byKind[kind] ?? [] }
 
+    func movieURLs() -> [URL] {
+        var seen = Set<URL>()
+        var urls: [URL] = []
+        for record in records {
+            for sprite in record.sprites {
+                guard let url = sprite.movieURL, seen.insert(url).inserted else { continue }
+                urls.append(url)
+            }
+        }
+        return urls
+    }
+
     private static func hasRenderableMedia(_ record: AssetRecord) -> Bool {
         switch record.kind {
         case .activeScene, .characterSceneTransitionPose:

@@ -20,6 +20,8 @@ struct FrameDecoderSmoke {
         verifyDeferredBoundaryAdvance()
         verifyPlayerPolicy()
         verifyOffscreenSuspensionPolicy()
+        verifyMediaTimingFallbackRemoved()
+        verifyMediaTimingCancellation()
         try verifyNaturalBoundaryAdvance()
         print("Frame decoder smoke passed: in-flight and queued cancellation, trimmed raster placement, opaque dissolve, and deferred end-of-movie advance.")
         if CommandLine.arguments.count == 2 {
@@ -329,6 +331,33 @@ struct FrameDecoderSmoke {
         precondition(!player.allowsExternalPlayback, "external playback stayed enabled")
         precondition(!player.preventsDisplaySleepDuringVideoPlayback, "video playback still prevents display sleep")
         precondition(player.isMuted && player.volume == 0 && player.actionAtItemEnd == .pause)
+    }
+
+    private static func verifyMediaTimingFallbackRemoved() {
+        precondition(MediaTiming.validatedDuration(seconds: 1.25, loaded: true) == 1.25)
+        precondition(MediaTiming.validatedDuration(seconds: 0, loaded: true) == nil)
+        precondition(MediaTiming.validatedDuration(seconds: .nan, loaded: true) == nil)
+        precondition(MediaTiming.validatedDuration(seconds: 2, loaded: false) == nil)
+        precondition(MediaTiming.loopRepeatCount(loopDuration: 2, desiredLoop: 5) == 3)
+        precondition(MediaTiming.loopRepeatCount(loopDuration: 0, desiredLoop: 10) == nil)
+        precondition(MediaTiming.loopRepeatCount(loopDuration: .infinity, desiredLoop: 10) == nil)
+        let missing = URL(fileURLWithPath: "/tmp/snoopy-missing-\(UUID().uuidString).mov")
+        let finished = DispatchSemaphore(value: 0)
+        MediaTimingCache.shared.load(missing) { value in
+            precondition(value == nil, "a missing movie was given a placeholder duration")
+            finished.signal()
+        }
+        precondition(finished.wait(timeout: .now() + 5) == .success, "duration load did not finish")
+        precondition(MediaTimingCache.shared.duration(for: missing) == nil)
+    }
+
+    private static func verifyMediaTimingCancellation() {
+        let flag = CancelFlag()
+        precondition(!flag.isCancelled)
+        flag.cancel()
+        precondition(flag.isCancelled)
+        let missing = URL(fileURLWithPath: "/tmp/snoopy-cancelled-\(UUID().uuidString).mov")
+        precondition(MediaTimingCache.loadSource(missing, cancel: flag) == nil)
     }
 
     private static func verifyOffscreenSuspensionPolicy() {

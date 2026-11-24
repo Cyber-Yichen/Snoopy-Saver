@@ -87,17 +87,20 @@ final class SnoopyScreenSaverView: ScreenSaverView {
         let bundle = Bundle(for: SnoopyScreenSaverView.self)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Result { try AssetCatalog(bundle: bundle) }
-            DispatchQueue.main.async {
-                guard let self, self.sessionActive, self.generation == expected else { return }
-                switch result {
-                case .success(let catalog): self.catalog = catalog; self.playInitialScene()
-                case .failure(let error):
-                    NSLog("Snoopy Multi-Layer catalog error: %@", String(describing: error))
-                    // Retry once: ScreenSaverEngine may have raced a freshly
-                    // replaced bundle on disk.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                        guard let self, self.sessionActive, self.generation == expected else { return }
-                        self.startCatalogRetry(bundle: bundle, generation: expected)
+            let urls = (try? result.get())?.movieURLs() ?? []
+            MediaTimingCache.shared.prepare(urls) { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self, self.sessionActive, self.generation == expected else { return }
+                    switch result {
+                    case .success(let catalog): self.catalog = catalog; self.playInitialScene()
+                    case .failure(let error):
+                        NSLog("Snoopy Multi-Layer catalog error: %@", String(describing: error))
+                        // Retry once: ScreenSaverEngine may have raced a freshly
+                        // replaced bundle on disk.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                            guard let self, self.sessionActive, self.generation == expected else { return }
+                            self.startCatalogRetry(bundle: bundle, generation: expected)
+                        }
                     }
                 }
             }
@@ -107,9 +110,11 @@ final class SnoopyScreenSaverView: ScreenSaverView {
     private func startCatalogRetry(bundle: Bundle, generation expected: Int) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = try? AssetCatalog(bundle: bundle)
-            DispatchQueue.main.async {
-                guard let self, self.sessionActive, self.generation == expected, let result else { return }
-                self.catalog = result; self.playInitialScene()
+            MediaTimingCache.shared.prepare(result?.movieURLs() ?? []) { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self, self.sessionActive, self.generation == expected, let result else { return }
+                    self.catalog = result; self.playInitialScene()
+                }
             }
         }
     }
